@@ -1,0 +1,248 @@
+// This file is part of thymiodirect.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// C translation of the Python demo that communicates with a Thymio over
+// serial (with TCP fallback), uploads bytecode, and streams variables/events.
+//
+// Build (example):
+//   cc -std=c11 -Wall -Wextra -O2 thymio_demo.c -o thymio_demo \
+//      -lthymiodirect_c -lpthread
+//
+// Notes:
+// - Replace the "thymiodirect_c.h" API with your real C SDK headers.
+// - If your SDK doesn't include an assembler, either pre-assemble the code
+//   into bytecode (uint16_t array) or compile/ship an assembler and call it.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <signal.h>
+
+#include "thymiodirect_c.h"   // <--- hypothetical C SDK for Thymio Direct
+// ==============================================
+
+typedef struct {
+    bool use_tcp;
+    bool debug;
+} Options;
+
+// Forward decls
+static void on_connection_changed(TD_Session *th, TD_NodeId node_id, bool connected, void *userdata);
+static void on_variables_received(TD_Session *th, TD_NodeId node_id, void *userdata);
+static void on_user_event(TD_Session *th, TD_NodeId node_id, uint16_t event_id,
+                          const uint16_t *event_args, size_t nargs, void *userdata);
+
+static volatile sig_atomic_t g_stop = 0;
+static void handle_sigint(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
+
+static const char *program_src =
+    "                dc end_toc                  ; total size of event handler table\n"
+    "                dc _ev.init, init           ; id and address of init event\n"
+    "                dc _ev.button.left, btnleft ; id and address of button.left event\n"
+    "            end_toc:\n"
+    "\n"
+    "            init:                           ; code executed on init event\n"
+    "                push.s 0                    ; initialize counter\n"
+    "                store counter\n"
+    "                push.s 0                    ; push address of 3rd arg, stored somewhere in free memory\n"
+    "                store _userdata\n"
+    "                push.s _userdata\n"
+    "                push.s 32                   ; push address of 2nd arg\n"
+    "                store _userdata+1\n"
+    "                push.s _userdata+1\n"
+    "                push.s 32                   ; push address of 1st arg\n"
+    "                store _userdata+2\n"
+    "                push.s _userdata+2\n"
+    "                callnat _nf.leds.top        ; call native function to set top rgb led\n"
+    "                stop                        ; stop program\n"
+    "\n"
+    "            btnleft:\n"
+    "                emit myid, counter, 1       ; emit myid with current counter value\n"
+    "                load counter                ; increment counter\n"
+    "                push.s 1\n"
+    "                add\n"
+    "                store counter\n"
+    "                stop\n"
+    "            myid:\n"
+    "                equ 0\n"
+    "            counter:\n"
+    "                equ _userdata+3\n";
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [--tcp] [--debug]\n", prog);
+}
+
+// Register callbacks and enter the SDK’s task loop
+static int run_demo(TD_Session *th) {
+    TD_Callbacks cbs = {
+        .on_connection_changed = on_connection_changed,
+        .on_variables_received = on_variables_received,
+        .on_user_event         = on_user_event,
+        .userdata              = NULL
+    };
+    TD_set_callbacks(th, &cbs);
+
+    // The Python code calls th.run_tasks(), which blocks pumping IO/callbacks.
+    // We mimic that here; break out on SIGINT or session stop.
+    while (!g_stop && TD_is_running(th)) {
+        TD_poll(th, /*timeout_ms=*/50); // or TD_run_tasks(th) if provided
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    Options opt = { .use_tcp = false, .debug = false };
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--tcp") == 0) {
+            opt.use_tcp = true;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            opt.debug = true;
+        } else {
+            fprintf(stderr, "Unknown option %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    signal(SIGINT, handle_sigint);
+
+    TD_Session *th = NULL;
+
+    if (!opt.use_tcp) {
+        // Try serial first (discover_rate=2 Hz, refreshing_rate=0.5 s)
+        TD_SerialOptions sopt = {
+            .discover_rate_hz = 2.0,
+            .refreshing_rate_s = 0.5,
+            .debug = opt.debug
+        };
+        TD_Error err = TD_open_serial(&th, &sopt);
+        if (err != TD_OK) {
+            fprintf(stderr, "Serial open failed (fallback to TCP): %s\n", TD_errstr(err));
+            opt.use_tcp = true;
+        }
+    }
+
+    if (opt.use_tcp) {
+        // Try TCP on default local port (e.g., asebamedulla default)
+        TD_TCPOptions topt = {
+            .host = "127.0.0.1",
+            .port = 33333,          // adapt to your daemon’s port
+            .discover_rate_hz = 2.0,
+            .refreshing_rate_s = 0.5,
+            .debug = opt.debug
+        };
+        TD_Error err = TD_open_tcp(&th, &topt);
+        if (err != TD_OK) {
+            fprintf(stderr, "TCP open failed: %s\n", TD_errstr(err));
+            return 2;
+        }
+    }
+
+    int rc = run_demo(th);
+
+    TD_close(&th);
+    return rc;
+}
+
+// =================== Callbacks ===================
+
+// Called on connect/disconnect; on connect, print node info, assemble & run program.
+static void on_connection_changed(TD_Session *th, TD_NodeId node_id, bool connected, void *userdata) {
+    (void)userdata;
+
+    printf("%s %u\n", connected ? "Connection" : "Disconnection", (unsigned)node_id);
+    if (!connected) return;
+
+    // Display node information
+    TD_RemoteNode rn;
+    if (TD_get_remote_node(th, node_id, &rn) == TD_OK) {
+        if (rn.name && rn.name[0])          printf("Node name: %s\n", rn.name);
+        if (rn.device_name && rn.device_name[0])  printf("Device name: %s\n", rn.device_name);
+        if (rn.device_uuid && rn.device_uuid[0])  printf("Device uuid: %s\n", rn.device_uuid);
+    }
+
+    // Assemble the program (same source used in Python)
+    // If your SDK has an assembler:
+    //   TD_Assembler *as = TD_asm_create(th, node_id);
+    //   TD_Bytecode bc;
+    //   TD_asm_assemble(as, program_src, &bc);
+    // Otherwise: pre-assemble offline and embed as uint16_t[].
+
+    TD_Bytecode bc = {0};
+    TD_Error aerr = TD_assemble(th, node_id, program_src, &bc); // <--- replace with your assembler call
+    if (aerr != TD_OK) {
+        fprintf(stderr, "Assemble failed: %s\n", TD_errstr(aerr));
+        return;
+    }
+
+    // Send bytecode & run
+    TD_Error err = TD_set_bytecode(th, node_id, bc.data, bc.words);
+    if (err != TD_OK) {
+        fprintf(stderr, "set_bytecode failed: %s\n", TD_errstr(err));
+        TD_bytecode_free(&bc);
+        return;
+    }
+
+    err = TD_run(th, node_id);
+    if (err != TD_OK) {
+        fprintf(stderr, "run failed: %s\n", TD_errstr(err));
+    }
+
+    TD_bytecode_free(&bc);
+}
+
+// Periodic variables callback: print prox.horizontal and quit if button.center touched
+static void on_variables_received(TD_Session *th, TD_NodeId node_id, void *userdata) {
+    (void)userdata;
+
+    // The Python accessed th[node_id]['prox.horizontal'] (array of 7-ish ints) and 'button.center'
+    int prox_vals[16] = {0};
+    size_t prox_len = sizeof(prox_vals)/sizeof(prox_vals[0]);
+    bool has_prox = TD_get_variable_i16(th, node_id, "prox.horizontal", prox_vals, &prox_len) == TD_OK;
+
+    int button_center = 0;
+    size_t one = 1;
+    bool has_btn = TD_get_variable_i16(th, node_id, "button.center", &button_center, &one) == TD_OK;
+
+    if (has_prox) {
+        printf("Node %u: prox.horizontal =", (unsigned)node_id);
+        for (size_t i = 0; i < prox_len; ++i) {
+            printf(" %d", prox_vals[i]);
+        }
+        printf("\n");
+    } else {
+        // Fallback: print the node record if available
+        TD_RemoteNode rn;
+        if (TD_get_remote_node(th, node_id, &rn) == TD_OK) {
+            printf("on_variables_received: node %u (name=%s)\n",
+                   (unsigned)node_id, rn.name ? rn.name : "(none)");
+        } else {
+            printf("on_variables_received: node %u (unknown)\n", (unsigned)node_id);
+        }
+    }
+
+    if (has_btn && button_center) {
+        // Equivalent to th.shutdown() in Python
+        printf("button.center touched; shutting down.\n");
+        TD_stop(th); // Ask the session loop to stop
+        g_stop = 1;
+    }
+}
+
+// User event callback: print event id and args
+static void on_user_event(TD_Session *th, TD_NodeId node_id, uint16_t event_id,
+                          const uint16_t *event_args, size_t nargs, void *userdata) {
+    (void)th; (void)userdata;
+
+    printf("Node %u: rcv event %u, value=[", (unsigned)node_id, event_id);
+    for (size_t i = 0; i < nargs; ++i) {
+        if (i) printf(", ");
+        printf("%u", (unsigned)event_args[i]);
+    }
+    printf("]\n");
+}
