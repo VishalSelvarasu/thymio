@@ -1,0 +1,231 @@
+// This file is part of thymiodirect.
+// Copyright 2020 ECOLE POLYTECHNIQUE FEDERALE DE LAUSANNE,
+// Miniature Mobile Robots group, Switzerland
+// Author: Yves Piguet
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+// Test of the communication with Thymio via serial port
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <time.h>
+
+// Placeholder for Thymio library in C
+// Since thymiodirect is a Python library, in C you would need to use
+// a corresponding C library or implement serial/TCP communication yourself.
+
+// Here we define dummy structs and functions to illustrate the translation.
+
+typedef struct {
+    char *device;
+} ThymioSerialPortInfo;
+
+typedef struct {
+    bool use_tcp;
+    char *serial_port;
+    char *host;
+    int tcp_port;
+    // other fields as needed
+} Thymio;
+
+typedef struct {
+    int prox_horizontal[7];
+    int button_center;
+    int leds_top[3];
+    int motor_left_target;
+    int motor_right_target;
+} ThymioNodeVariables;
+
+typedef struct {
+    int id;
+    ThymioNodeVariables vars;
+} ThymioNode;
+
+ThymioSerialPortInfo* get_thymio_serial_ports(int *count) {
+    // Dummy implementation: pretend we found one port
+    *count = 1;
+    ThymioSerialPortInfo *ports = malloc(sizeof(ThymioSerialPortInfo) * (*count));
+    ports[0].device = "/dev/ttyACM0";
+    return ports;
+}
+
+Thymio* Thymio_new(bool use_tcp, char *serial_port, char *host, int tcp_port) {
+    Thymio *th = malloc(sizeof(Thymio));
+    th->use_tcp = use_tcp;
+    th->serial_port = serial_port ? strdup(serial_port) : NULL;
+    th->host = host ? strdup(host) : NULL;
+    th->tcp_port = tcp_port;
+    return th;
+}
+
+void Thymio_free(Thymio *th) {
+    if (th) {
+        if (th->serial_port) free(th->serial_port);
+        if (th->host) free(th->host);
+        free(th);
+    }
+}
+
+int Thymio_connect(Thymio *th) {
+    // Dummy connect always succeeds
+    return 0;
+}
+
+void Thymio_disconnect(Thymio *th) {
+    // Dummy disconnect
+}
+
+int Thymio_first_node(Thymio *th) {
+    // Dummy node id
+    return 1;
+}
+
+ThymioNodeVariables* Thymio_variables(Thymio *th, int id) {
+    // Dummy variables
+    static ThymioNodeVariables vars = {
+        .prox_horizontal = {0,0,10,0,0,20,0},
+        .button_center = 0,
+        .leds_top = {0,0,0},
+        .motor_left_target = 0,
+        .motor_right_target = 0
+    };
+    return &vars;
+}
+
+void Thymio_set_leds_top(Thymio *th, int id, int r, int g, int b) {
+    ThymioNodeVariables *vars = Thymio_variables(th, id);
+    vars->leds_top[0] = r;
+    vars->leds_top[1] = g;
+    vars->leds_top[2] = b;
+    printf("Set leds.top to [%d, %d, %d]\n", r, g, b);
+}
+
+void Thymio_set_motor_targets(Thymio *th, int id, int target) {
+    ThymioNodeVariables *vars = Thymio_variables(th, id);
+    vars->motor_left_target = target;
+    vars->motor_right_target = target;
+    printf("Set motor.left.target and motor.right.target to %d\n", target);
+}
+
+bool Thymio_get_button_center(Thymio *th, int id) {
+    ThymioNodeVariables *vars = Thymio_variables(th, id);
+    return vars->button_center != 0;
+}
+
+// Simulate updating prox_horizontal values for testing
+void Thymio_update_prox_horizontal(Thymio *th, int id, int left, int right) {
+    ThymioNodeVariables *vars = Thymio_variables(th, id);
+    vars->prox_horizontal[2] = left;
+    vars->prox_horizontal[5] = right;
+}
+
+// Main program
+
+int main(int argc, char *argv[]) {
+    bool use_tcp = false;
+    char *serial_port = NULL;
+    char *host = NULL;
+    int tcp_port = 0;
+
+    if (argc == 3) {
+        use_tcp = true;
+        host = argv[1];
+        tcp_port = atoi(argv[2]);
+    } else if (argc == 2) {
+        if (strcmp(argv[1], "--help") == 0) {
+            printf("Usage: %s [serial_port | host port]\n", argv[0]);
+            return 0;
+        }
+        serial_port = argv[1];
+    }
+
+    if (tcp_port == 0 && serial_port == NULL) {
+        int count = 0;
+        ThymioSerialPortInfo *ports = get_thymio_serial_ports(&count);
+        if (count > 0) {
+            serial_port = ports[0].device;
+            printf("Thymio serial ports:\n");
+            for (int i = 0; i < count; i++) {
+                printf("  %s %s\n", ports[i].device, ports[i].device);
+            }
+        }
+        free(ports);
+    }
+
+    Thymio *th = NULL;
+    if ((th = Thymio_new(use_tcp, serial_port, host, tcp_port)) == NULL) {
+        fprintf(stderr, "Error creating Thymio object\n");
+        return 1;
+    }
+
+    if (Thymio_connect(th) != 0) {
+        fprintf(stderr, "Error connecting to Thymio\n");
+        Thymio_free(th);
+        return 1;
+    }
+
+    int id = Thymio_first_node(th);
+    printf("id: %d\n", id);
+
+    ThymioNodeVariables *vars = Thymio_variables(th, id);
+    printf("variables: prox.horizontal[2]=%d prox.horizontal[5]=%d button.center=%d\n",
+           vars->prox_horizontal[2], vars->prox_horizontal[5], vars->button_center);
+    printf("events: (not implemented in C example)\n");
+    printf("native functions: (not implemented in C example)\n");
+
+    // Get a variable
+    int prox_h_5 = vars->prox_horizontal[5];
+    int prox_h_2 = vars->prox_horizontal[2];
+
+    // Set a variable (leds.top)
+    Thymio_set_leds_top(th, id, 0, 0, 32);
+
+    int prox_prev = 0;
+    bool done = false;
+
+    while (!done) {
+        // Simulate reading prox.horizontal sensor values
+        // For demonstration, we toggle values every iteration
+        static int toggle = 0;
+        if (toggle == 0) {
+            Thymio_update_prox_horizontal(th, id, 10, 20);
+            toggle = 1;
+        } else {
+            Thymio_update_prox_horizontal(th, id, 15, 25);
+            toggle = 0;
+        }
+
+        vars = Thymio_variables(th, id);
+        int prox = (vars->prox_horizontal[5] - vars->prox_horizontal[2]) / 10;
+
+        if (prox != prox_prev) {
+            Thymio_set_motor_targets(th, id, prox);
+            printf("%d\n", prox);
+            if (prox > 5) {
+                Thymio_set_leds_top(th, id, 0, 32, 0);
+            } else if (prox < -5) {
+                Thymio_set_leds_top(th, id, 32, 32, 0);
+            } else if (prox > -3 && prox < 3) {
+                Thymio_set_leds_top(th, id, 0, 0, 32);
+            }
+            prox_prev = prox;
+        }
+
+        if (Thymio_get_button_center(th, id)) {
+            printf("button.center\n");
+            done = true;
+        }
+
+        struct timespec ts = {0, 100000000L}; // 0.1 sec
+        nanosleep(&ts, NULL);
+    }
+
+    Thymio_disconnect(th);
+    Thymio_free(th);
+
+    return 0;
+}
