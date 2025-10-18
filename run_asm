@@ -1,0 +1,216 @@
+// This file is part of thymiodirect.
+// Copyright 2020 ECOLE POLYTECHNIQUE FEDERALE DE LAUSANNE,
+// Miniature Mobile Robots group, Switzerland
+// Author: Yves Piguet
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <signal.h>
+
+// Note: The original Python code uses asynchronous callbacks and a high-level library
+// 'thymiodirect' to communicate with Thymio robots over serial or TCP.
+// In C, this requires a substantial implementation of the protocol and asynchronous event handling,
+// which is not trivial to replicate fully here without the actual library or protocol details.
+
+// This C code provides a structural equivalent focusing on the main logic flow,
+// command line parsing, reading the assembly file or stdin, and placeholders for connection handling.
+
+// Placeholder structs and functions to simulate the thymiodirect API
+typedef struct {
+    // Placeholder for remote node info
+    int node_id;
+} RemoteNode;
+
+typedef struct {
+    // Placeholder for connection object
+    bool use_tcp;
+    bool debug;
+} Connection;
+
+typedef struct {
+    // Placeholder for Assembler object
+    RemoteNode *remote_node;
+    char *asm_code;
+} Assembler;
+
+typedef struct {
+    // Placeholder for bytecode
+    unsigned char *data;
+    size_t length;
+} Bytecode;
+
+static volatile bool code_sent = false;
+
+void print_usage(const char *progname) {
+    fprintf(stderr, "Usage: %s [--tcp] [program.asm]\n", progname);
+}
+
+char *read_file(const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        perror("Error opening file");
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    rewind(f);
+    char *buffer = malloc(fsize + 1);
+    if (!buffer) {
+        fclose(f);
+        fprintf(stderr, "Memory allocation failed\n");
+        return NULL;
+    }
+    fread(buffer, 1, fsize, f);
+    buffer[fsize] = '\0';
+    fclose(f);
+    return buffer;
+}
+
+char *read_stdin() {
+    size_t size = 1024;
+    size_t len = 0;
+    char *buffer = malloc(size);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        return NULL;
+    }
+    int c;
+    while ((c = fgetc(stdin)) != EOF) {
+        buffer[len++] = (char)c;
+        if (len == size) {
+            size *= 2;
+            char *tmp = realloc(buffer, size);
+            if (!tmp) {
+                free(buffer);
+                fprintf(stderr, "Memory allocation failed\n");
+                return NULL;
+            }
+            buffer = tmp;
+        }
+    }
+    buffer[len] = '\0';
+    return buffer;
+}
+
+// Placeholder for assembling code
+Bytecode assemble(Assembler *assembler) {
+    // In real implementation, assemble asm_code into bytecode
+    Bytecode bc = {NULL, 0};
+    (void)assembler;
+    return bc;
+}
+
+// Placeholder for setting bytecode on node
+void set_bytecode(Connection *conn, int node_id, Bytecode *bc) {
+    (void)conn; (void)node_id; (void)bc;
+    // Send bytecode to node
+}
+
+// Placeholder for running program on node
+void run_node(Connection *conn, int node_id) {
+    (void)conn; (void)node_id;
+    // Run program on node
+}
+
+// Placeholder for connection changed callback
+void on_connection_changed(Connection *conn, int node_id, bool connected, char *asm_code) {
+    if (connected) {
+        RemoteNode remote_node = {node_id};
+        Assembler assembler = {&remote_node, asm_code};
+        Bytecode bc = assemble(&assembler);
+        set_bytecode(conn, node_id, &bc);
+        run_node(conn, node_id);
+        code_sent = true;
+    }
+}
+
+// Placeholder for execution state changed callback
+void on_execution_state_changed(int node_id, int pc, int flags) {
+    (void)node_id; (void)pc; (void)flags;
+    if (code_sent) {
+        // Forced exit despite asynchronous operations
+        exit(0);
+    }
+}
+
+// Placeholder for running event loop until executed
+void run_until_executed(Connection *conn, char *asm_code) {
+    // In real implementation, assign callbacks and run event loop
+    // Here we simulate connection and execution events
+    int node_id = 1;
+    on_connection_changed(conn, node_id, true, asm_code);
+    // Simulate execution state change after sending code
+    on_execution_state_changed(node_id, 0, 0);
+}
+
+// Placeholder for opening serial connection
+bool open_serial_connection(Connection *conn, bool debug) {
+    (void)debug;
+    conn->use_tcp = false;
+    conn->debug = debug;
+    // Simulate success or failure
+    return true; // or false to simulate failure
+}
+
+// Placeholder for opening TCP connection
+bool open_tcp_connection(Connection *conn, bool debug) {
+    (void)debug;
+    conn->use_tcp = true;
+    conn->debug = debug;
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    char *asm_code = NULL;
+    bool use_tcp = false;
+    bool debug = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--tcp") == 0) {
+            use_tcp = true;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            debug = true;
+        } else if (strncmp(argv[i], "--", 2) == 0 || asm_code != NULL) {
+            print_usage(argv[0]);
+            return 1;
+        } else {
+            asm_code = read_file(argv[i]);
+            if (!asm_code) {
+                return 1;
+            }
+        }
+    }
+
+    if (!asm_code) {
+        asm_code = read_stdin();
+        if (!asm_code) {
+            return 1;
+        }
+    }
+
+    Connection conn;
+
+    if (!use_tcp) {
+        if (!open_serial_connection(&conn, debug)) {
+            use_tcp = true;
+        }
+    }
+
+    if (use_tcp) {
+        if (!open_tcp_connection(&conn, debug)) {
+            fprintf(stderr, "Failed to open TCP connection\n");
+            free(asm_code);
+            return 1;
+        }
+    }
+
+    run_until_executed(&conn, asm_code);
+
+    free(asm_code);
+    return 0;
+}
