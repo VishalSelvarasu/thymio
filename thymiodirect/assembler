@@ -1,0 +1,639 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <assert.h>
+
+/* ------------------------ Small utilities ------------------------ */
+
+static char *strdup_s(const char *s){
+    if(!s) return NULL;
+    size_t n = strlen(s);
+    char *p = (char*)malloc(n+1);
+    if(!p){ fprintf(stderr,"OOM\n"); exit(1); }
+    memcpy(p,s,n+1);
+    return p;
+}
+
+static void rtrim(char *s){
+    size_t n = strlen(s);
+    while(n>0 && (unsigned char)s[n-1] <= ' ') s[--n] = 0;
+}
+static char* lskip(const char *s){
+    while(*s && (unsigned char)*s <= ' ') s++;
+    return (char*)s;
+}
+static void trim(char *s){
+    char *p = lskip(s);
+    if(p!=s) memmove(s,p,strlen(p)+1);
+    rtrim(s);
+}
+
+/* ------------------------ Dynamic arrays ------------------------ */
+
+typedef struct { uint16_t *v; int n, cap; } U16Vec;
+static void u16_push(U16Vec *a, uint16_t x){
+    if(a->n==a->cap){ a->cap = a->cap? a->cap*2:16; a->v = (uint16_t*)realloc(a->v, a->cap*sizeof(uint16_t)); if(!a->v){fprintf(stderr,"OOM\n"); exit(1);} }
+    a->v[a->n++] = x;
+}
+
+typedef struct { char **v; int n, cap; } StrVec;
+static void svec_push(StrVec *a, const char *s){
+    if(a->n==a->cap){ a->cap = a->cap? a->cap*2:16; a->v = (char**)realloc(a->v, a->cap*sizeof(char*)); if(!a->v){fprintf(stderr,"OOM\n"); exit(1);} }
+    a->v[a->n++] = strdup_s(s);
+}
+static void svec_free(StrVec *a){
+    for(int i=0;i<a->n;i++) free(a->v[i]);
+    free(a->v);
+}
+
+/* ------------------------ RemoteNode stub ------------------------ */
+
+typedef struct {
+    // variables
+    StrVec named_variables;        // names
+    U16Vec var_offset;             // same length as named_variables
+    uint16_t var_total_size;
+    uint16_t max_var_size;
+
+    // local events (names)
+    StrVec local_events;
+
+    // native functions (names)
+    StrVec native_functions;
+} RemoteNode;
+
+static void remotenode_init_demo(RemoteNode *rn){
+    memset(rn,0,sizeof(*rn));
+    // Example content — replace with your real node description
+    svec_push(&rn->named_variables, "foo");    u16_push(&rn->var_offset, 10);
+    svec_push(&rn->named_variables, "bar");    u16_push(&rn->var_offset, 20);
+    rn->var_total_size = 128;
+    rn->max_var_size   = 1024;
+
+    svec_push(&rn->local_events, "init");      // -> _ev.init will be 0xffff, then 0xfffe - i
+
+    svec_push(&rn->native_functions, "set");   // _nf.set -> 0
+    svec_push(&rn->native_functions, "get");   // _nf.get -> 1
+}
+
+/* ------------------------ Symbol table ------------------------ */
+
+typedef struct {
+    char *name;
+    int   value;
+    bool  defined;
+} Sym;
+
+typedef struct {
+    Sym *v; int n, cap;
+} SymTab;
+
+static Sym* sym_lookup(SymTab *st, const char *name, bool create){
+    for(int i=0;i<st->n;i++){
+        if(strcmp(st->v[i].name, name)==0) return &st->v[i];
+    }
+    if(!create) return NULL;
+    if(st->n==st->cap){ st->cap = st->cap? st->cap*2:16; st->v = (Sym*)realloc(st->v, st->cap*sizeof(Sym)); if(!st->v){fprintf(stderr,"OOM\n"); exit(1);} }
+    st->v[st->n].name = strdup_s(name);
+    st->v[st->n].value = 0;
+    st->v[st->n].defined = false;
+    return &st->v[st++->n]; // avoid -Wsequence warning; adjust below
+}
+static Sym* sym_insert(SymTab *st, const char *name){
+    if(st->n==st->cap){ st->cap = st->cap? st->cap*2:16; st->v = (Sym*)realloc(st->v, st->cap*sizeof(Sym)); if(!st->v){fprintf(stderr,"OOM\n"); exit(1);} }
+    st->v[st->n].name = strdup_s(name);
+    st->v[st->n].value = 0;
+    st->v[st->n].defined = false;
+    return &st->v[st->n++];
+}
+static Sym* sym_get_or_add(SymTab *st, const char *name){
+    for(int i=0;i<st->n;i++){
+        if(strcmp(st->v[i].name, name)==0) return &st->v[i];
+    }
+    return sym_insert(st, name);
+}
+static void sym_define(SymTab *st, const char *name, int value){
+    Sym *s = sym_get_or_add(st, name);
+    s->value = value;
+    s->defined = true;
+}
+
+static bool is_number(const char *s){
+    if(!*s) return false;
+    if(s[0]=='-' && s[1]) s++;
+    if(s[0]=='0' && (s[1]=='x' || s[1]=='X')){ // hex
+        s+=2; if(!*s) return false;
+        while(*s){ if(!isxdigit((unsigned char)*s)) return false; s++; }
+        return true;
+    }
+    while(*s){ if(!isdigit((unsigned char)*s)) return false; s++; }
+    return true;
+}
+
+static int parse_int0(const char *s){
+    // base autodetect like Python int(..., 0)
+    if(s[0]=='0' && (s[1]=='x' || s[1]=='X')) return (int)strtol(s, NULL, 16);
+    return (int)strtol(s, NULL, 10);
+}
+
+/* ------------------------ Instruction table ------------------------ */
+
+struct Assembler; // fwd
+
+typedef struct {
+    const char *name;
+    int  num_args;            // -1 for variable (dc), or fixed
+    // Either fixed code (null-terminated by length field), or to_code callback:
+    const uint16_t *fixed;    // fixed code words; NULL if uses to_code
+    void (*to_code)(struct Assembler*, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out);
+} InstrDef;
+
+/* ------------------------ Assembler ------------------------ */
+
+typedef struct Assembler {
+    RemoteNode *remote;
+    char *src;
+    // instruction set (filled in constructor)
+    InstrDef *defs;
+    int      ndefs;
+} Assembler;
+
+/* ------------------------ Error helper ------------------------ */
+
+static void die_line(int line, const char *msg){
+    fprintf(stderr, "%s (line %d)\n", msg, line);
+    exit(1);
+}
+
+/* ------------------------ resolve_symbol ------------------------ */
+
+static int resolve_symbol_expr(const char *expr, SymTab *defs, bool required, int line){
+    // Accept sequence of [+|-|name_or_number]
+    int val = 0;
+    bool minus = false;
+    const char *p = expr;
+    while(*p){
+        // skip spaces
+        while(*p && isspace((unsigned char)*p)) p++;
+        if(!*p) break;
+
+        if(*p=='+' || *p=='-'){
+            minus = (*p=='-');
+            p++;
+            continue;
+        }
+
+        // read token [._a-z0-9]+ (case-insensitive)
+        char tok[256]; int k=0;
+        while(*p && (isalnum((unsigned char)*p) || *p=='_' || *p=='.' || *p=='x')){ // 'x' to allow 0x...
+            if(k<255) tok[k++] = *p;
+            p++;
+        }
+        tok[k]=0;
+        if(k==0) die_line(line, "Syntax error");
+
+        int tval = 0;
+        if(is_number(tok)){
+            tval = parse_int0(tok);
+        } else {
+            Sym *s = NULL;
+            for(int i=0;i<defs->n;i++){
+                if(strcmp(defs->v[i].name, tok)==0){ s=&defs->v[i]; break; }
+            }
+            if(!s){
+                if(!required) tval = 0;
+                else {
+                    char buf[512]; snprintf(buf,sizeof(buf),"Unknown symbol \"%s\"", tok);
+                    die_line(line, buf);
+                }
+            }else{
+                if(!s->defined && required){
+                    char buf[512]; snprintf(buf,sizeof(buf),"Unknown symbol \"%s\"", tok);
+                    die_line(line, buf);
+                }
+                tval = s->value;
+            }
+        }
+        val += minus ? -tval : tval;
+
+        // next: optional spaces, then +/- or new token
+        while(*p && isspace((unsigned char)*p)) p++;
+    }
+    return val;
+}
+
+/* ------------------------ node_definitions ------------------------ */
+
+static void node_definitions(Assembler *a, SymTab *defs){
+    // variables
+    for(int i=0;i<a->remote->named_variables.n;i++){
+        const char *name = a->remote->named_variables.v[i];
+        uint16_t    off  = a->remote->var_offset.v[i];
+        sym_define(defs, name, off);
+    }
+    sym_define(defs, "_userdata", a->remote->var_total_size);
+    sym_define(defs, "_topdata",  a->remote->max_var_size);
+
+    // local events
+    sym_define(defs, "_ev.init", 0xffff);
+    for(int i=0;i<a->remote->local_events.n;i++){
+        char buf[256]; snprintf(buf,sizeof(buf), "_ev.%s", a->remote->local_events.v[i]);
+        sym_define(defs, buf, 0xfffe - i);
+    }
+
+    // native functions
+    for(int i=0;i<a->remote->native_functions.n;i++){
+        char buf[256]; snprintf(buf,sizeof(buf), "_nf.%s", a->remote->native_functions.v[i]);
+        sym_define(defs, buf, i);
+    }
+}
+
+/* ------------------------ to_code helpers (checks) ------------------------ */
+
+static void chk_small_int(int v, int line){
+    if(v >= 0x1000 || -v > 0x1000) die_line(line, "Small integer overflow");
+}
+static void chk_data_addr(int v, int line){
+    if(v < 0 || v >= 0x1000) die_line(line, "Data address out of range");
+}
+static void chk_id_12(int v, int line, const char *what){
+    if(v < 0 || v >= 0x1000){
+        char buf[128]; snprintf(buf,sizeof(buf), "%s out of range", what);
+        die_line(line, buf);
+    }
+}
+static void chk_sub_12(int v, int line){
+    if(v < 0 || v >= 0x1000) die_line(line, "Subroutine address out of range");
+}
+
+/* ------------------------ Instruction callbacks ------------------------ */
+
+static void emit1(U16Vec *out, uint16_t w){ u16_push(out, w); }
+static void emit2(U16Vec *out, uint16_t w1, uint16_t w2){ u16_push(out,w1); u16_push(out,w2); }
+static void emit3(U16Vec *out, uint16_t w1, uint16_t w2, uint16_t w3){ u16_push(out,w1); u16_push(out,w2); u16_push(out,w3); }
+
+static void op_dc(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    for(int i=0;i<argc;i++){
+        int v = resolve_symbol_expr(args[i], defs, phase==1, line);
+        emit1(out, (uint16_t)(v & 0xffff));
+    }
+}
+static void op_equ(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    (void)pc; (void)out;
+    if(!label) die_line(line, "No label for pseudo-instruction \"equ\"");
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    sym_define(defs, label, v);
+}
+static void op_push_s(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    (void)a;(void)pc;(void)label;(void)argc;
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_small_int(v, line);
+    emit1(out, (uint16_t)(0x1000 | (v & 0x0fff)));
+}
+static void op_push(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    emit2(out, 0x2000, (uint16_t)(v & 0xffff));
+}
+static void op_load(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_data_addr(v, line);
+    emit1(out, (uint16_t)(0x3000 | (v & 0x0fff)));
+}
+static void op_store(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_data_addr(v, line);
+    emit1(out, (uint16_t)(0x4000 | (v & 0x0fff)));
+}
+static void op_load_ind(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_data_addr(v, line);
+    int sz = resolve_symbol_expr(args[1], defs, phase==1, line);
+    emit2(out, (uint16_t)(0x5000 | (v & 0x0fff)), (uint16_t)(sz & 0xffff));
+}
+static void op_store_ind(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int v = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_data_addr(v, line);
+    int sz = resolve_symbol_expr(args[1], defs, phase==1, line);
+    emit2(out, (uint16_t)(0x6000 | (v & 0x0fff)), (uint16_t)(sz & 0xffff));
+}
+static void op_not_unary(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    (void)a;(void)pc;(void)args;(void)argc;(void)label;(void)defs;(void)phase;(void)out;
+    die_line(line, "Unary \"not\" not implemented in the VM");
+}
+static void op_jump(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int dest = resolve_symbol_expr(args[0], defs, phase==1, line);
+    emit1(out, (uint16_t)(0x9000 | ((dest - pc) & 0x0fff)));
+}
+
+// Helper: find single-word ALU opcode code (0x8000..0x8011 etc.)
+static int lookup_alu_code(Assembler *a, const char *name){
+    for(int i=0;i<a->ndefs;i++){
+        if(strcmp(a->defs[i].name, name)==0 && a->defs[i].fixed && !a->defs[i].to_code){
+            uint16_t op = a->defs[i].fixed[0];
+            if((op & 0xf000) == 0x8000) return op;
+        }
+    }
+    return -1;
+}
+
+static void op_jump_if_not(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int alu = lookup_alu_code(a, args[0]);
+    if(alu < 0) die_line(line, "Unknown op for jump.if.not");
+    int dest = resolve_symbol_expr(args[1], defs, phase==1, line);
+    emit2(out, (uint16_t)(0xa000 | (alu & 0x00ff)), (uint16_t)((dest - pc) & 0xffff));
+}
+static void op_do_jump_when_not(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int alu = lookup_alu_code(a, args[0]);
+    if(alu < 0) die_line(line, "Unknown op for do.jump.when.not");
+    int dest = resolve_symbol_expr(args[1], defs, phase==1, line);
+    emit2(out, (uint16_t)(0xa100 | (alu & 0x00ff)), (uint16_t)((dest - pc) & 0xffff));
+}
+static void op_dont_jump_when_not(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int alu = lookup_alu_code(a, args[0]);
+    if(alu < 0) die_line(line, "Unknown op for dont.jump.when.not");
+    int dest = resolve_symbol_expr(args[1], defs, phase==1, line);
+    emit2(out, (uint16_t)(0xa300 | (alu & 0x00ff)), (uint16_t)((dest - pc) & 0xffff));
+}
+static void op_emit(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int id   = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_id_12(id, line, "Event id");
+    int addr = resolve_symbol_expr(args[1], defs, phase==1, line);
+    int size = resolve_symbol_expr(args[2], defs, phase==1, line);
+    emit3(out, (uint16_t)(0xb000 | (id & 0x0fff)), (uint16_t)(addr & 0xffff), (uint16_t)(size & 0xffff));
+}
+static void op_callnat(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int id = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_id_12(id, line, "Native call id");
+    emit1(out, (uint16_t)(0xc000 | (id & 0x0fff)));
+}
+static void op_callsub(Assembler *a, int pc, char **args, int argc, const char *label, SymTab *defs, int phase, int line, U16Vec *out){
+    int addr = resolve_symbol_expr(args[0], defs, phase==1, line);
+    chk_sub_12(addr, line);
+    emit1(out, (uint16_t)(0xd000 | (addr & 0x0fff)));
+}
+
+/* ------------------------ Instruction table build ------------------------ */
+
+#define FIX1(x) (const uint16_t[]){ (uint16_t)(x) }
+
+static void assembler_build_defs(Assembler *a){
+    // Build array (names must match Python keys)
+    static InstrDef tbl[] = {
+        {"dc",               -1, NULL,         op_dc},
+        {"equ",               1, NULL,         op_equ},
+        {"stop",              0, FIX1(0x0000), NULL},
+        {"push.s",            1, NULL,         op_push_s},
+        {"push",              1, NULL,         op_push},
+        {"load",              1, NULL,         op_load},
+        {"store",             1, NULL,         op_store},
+        {"load.ind",          2, NULL,         op_load_ind},
+        {"store.ind",         2, NULL,         op_store_ind},
+        {"neg",               0, FIX1(0x7000), NULL},
+        {"abs",               0, FIX1(0x7001), NULL},
+        {"bitnot",            0, FIX1(0x7002), NULL},
+        {"not",               0, NULL,         op_not_unary},
+        {"sl",                0, FIX1(0x8000), NULL},
+        {"asr",               0, FIX1(0x8001), NULL},
+        {"add",               0, FIX1(0x8002), NULL},
+        {"sub",               0, FIX1(0x8003), NULL},
+        {"mult",              0, FIX1(0x8004), NULL},
+        {"div",               0, FIX1(0x8005), NULL},
+        {"mod",               0, FIX1(0x8006), NULL},
+        {"bitor",             0, FIX1(0x8007), NULL},
+        {"bitxor",            0, FIX1(0x8008), NULL},
+        {"bitand",            0, FIX1(0x8009), NULL},
+        {"eq",                0, FIX1(0x800a), NULL},
+        {"ne",                0, FIX1(0x800b), NULL},
+        {"gt",                0, FIX1(0x800c), NULL},
+        {"ge",                0, FIX1(0x800d), NULL},
+        {"lt",                0, FIX1(0x800e), NULL},
+        {"le",                0, FIX1(0x800f), NULL},
+        {"or",                0, FIX1(0x8010), NULL},
+        {"and",               0, FIX1(0x8011), NULL},
+        {"jump",              1, NULL,         op_jump},
+        {"jump.if.not",       2, NULL,         op_jump_if_not},
+        {"do.jump.when.not",  2, NULL,         op_do_jump_when_not},
+        {"dont.jump.when.not",2, NULL,         op_dont_jump_when_not},
+        {"emit",              3, NULL,         op_emit},
+        {"callnat",           1, NULL,         op_callnat},
+        {"callsub",           1, NULL,         op_callsub},
+        {"ret",               0, FIX1(0xe000), NULL},
+    };
+    a->defs  = (InstrDef*)malloc(sizeof(tbl));
+    if(!a->defs){ fprintf(stderr,"OOM\n"); exit(1); }
+    memcpy(a->defs, tbl, sizeof(tbl));
+    a->ndefs = (int)(sizeof(tbl)/sizeof(tbl[0]));
+}
+
+/* ------------------------ Parser helpers ------------------------ */
+
+static InstrDef* find_instr(Assembler *a, const char *name){
+    for(int i=0;i<a->ndefs;i++) if(strcmp(a->defs[i].name, name)==0) return &a->defs[i];
+    return NULL;
+}
+
+// Split a CSV/whitespace arg string into tokens (commas and spaces are separators)
+static int split_args(char *s, char **out, int max_out){
+    int n=0;
+    char *p = s;
+    while(*p){
+        // skip separators
+        while(*p && (isspace((unsigned char)*p) || *p==',')) p++;
+        if(!*p) break;
+        char *start = p;
+        // token continues until comma or whitespace
+        while(*p && !(isspace((unsigned char)*p) || *p==',')) p++;
+        int len = (int)(p - start);
+        if(len>0){
+            if(n<max_out){
+                out[n] = (char*)malloc(len+1);
+                memcpy(out[n], start, len); out[n][len]=0;
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* ------------------------ Assembler core ------------------------ */
+
+static U16Vec assemble_run(Assembler *a){
+    // Build initial defs from node
+    SymTab defs = {0};
+    node_definitions(a, &defs);
+
+    // Split source into lines (modify in place)
+    char *src = strdup_s(a->src);
+    int   lines_cap=0, lines_n=0;
+    char **lines = NULL;
+
+    // Count lines and build array
+    for(char *p = src; *p; ){
+        char *e = strchr(p, '\n');
+        if(!e) e = p + strlen(p);
+        int len = (int)(e - p);
+        char *one = (char*)malloc(len+1);
+        memcpy(one, p, len); one[len]=0;
+        if(lines_n==lines_cap){ lines_cap = lines_cap? lines_cap*2:64; lines = (char**)realloc(lines, lines_cap*sizeof(char*)); }
+        lines[lines_n++] = one;
+        p = *e ? e+1 : e;
+    }
+
+    U16Vec final_code = {0};
+
+    for(int phase=0; phase<2; ++phase){
+        U16Vec bytecode = {0};
+        const char *pending_label = NULL; // label captured for line with only label
+
+        for(int i=0;i<lines_n;i++){
+            int line_no = i+1;
+            char *line = lines[i];
+
+            // Remove comments starting with ';'
+            char *sc = strchr(line, ';');
+            if(sc) *sc = 0;
+            trim(line);
+            if(line[0]==0) continue; // blank
+
+            // If a label is present (e.g., "foo:" or "foo: instr ...")
+            char *colon = strchr(line, ':');
+            char *instr_start = line;
+            char label_buf[256]; label_buf[0]=0;
+
+            if(colon){
+                // ensure colon occurs before any space token of instruction name
+                // We'll treat any "name:" at beginning as label
+                int prefix_only_label = 1;
+                for(char *q=line; q<colon; ++q){
+                    if(isspace((unsigned char)*q)){ prefix_only_label = 0; break; }
+                }
+                if(prefix_only_label){
+                    int lab_len = (int)(colon - line);
+                    if(lab_len >= 255) lab_len = 255;
+                    memcpy(label_buf, line, lab_len); label_buf[lab_len]=0;
+                    instr_start = colon + 1;
+                    // define label position BEFORE executing instruction on same line
+                    // (position == current bytecode length)
+                    if(phase==0 || phase==1){
+                        sym_define(&defs, label_buf, bytecode.n);
+                    }
+                }
+            }
+
+            // parse instruction name (if any)
+            char *p = lskip(instr_start);
+            if(*p==0){
+                // label-only line
+                continue;
+            }
+
+            // extract opcode token
+            char opname[128]={0};
+            int k=0;
+            while(*p && !isspace((unsigned char)*p)){ if(k<127) opname[k++]=*p; p++; }
+            opname[k]=0;
+            p = lskip(p);
+
+            if(opname[0]==0){
+                // label-only already handled
+                continue;
+            }
+
+            InstrDef *id = find_instr(a, opname);
+            if(!id){
+                char buf[256]; snprintf(buf,sizeof(buf), "Unknown instruction %s", opname);
+                die_line(line_no, buf);
+            }
+
+            // collect arguments
+            char *argstr = strdup_s(p);
+            char *argv[64]; int argc = 0;
+            if(argstr[0]){
+                argc = split_args(argstr, argv, 64);
+            }
+
+            // fixed code?
+            if(id->fixed && !id->to_code){
+                // append fixed words
+                // NOTE: each fixed here is single word
+                emit1(&bytecode, id->fixed[0]);
+            } else if(id->to_code){
+                // Convert Python's behavior: integers if strictly number, else keep raw string
+                // Here, we always pass strings; the resolver parses numbers itself.
+                id->to_code(a, bytecode.n, argv, argc, label_buf[0]?label_buf:NULL, &defs, phase, line_no, &bytecode);
+            }
+
+            for(int t=0;t<argc;t++) free(argv[t]);
+            free(argstr);
+        }
+
+        if(phase==1){
+            final_code = bytecode; // take ownership
+        }else{
+            free(bytecode.v);
+        }
+    }
+
+    // cleanup
+    for(int i=0;i<lines_n;i++) free(lines[i]);
+    free(lines);
+    free(src);
+    // (defs table intentionally kept alive only for assembly lifetime; freed by OS)
+
+    return final_code;
+}
+
+/* ------------------------ API ------------------------ */
+
+static void assembler_init(Assembler *a, RemoteNode *rn, const char *src_text){
+    a->remote = rn;
+    a->src    = strdup_s(src_text);
+    assembler_build_defs(a);
+}
+
+static void assembler_free(Assembler *a){
+    free(a->src);
+    free(a->defs);
+}
+
+/* ------------------------ Test (mirrors Python test()) ------------------------ */
+
+static void test(RemoteNode *rn_opt){
+    RemoteNode rn_local, *rn = rn_opt ? rn_opt : &rn_local;
+    if(!rn_opt) remotenode_init_demo(rn);
+
+    const char *src =
+        "foo:\n"
+        "    equ 5\n"
+        "\n"
+        "    dc end_toc\n"
+        "    dc _ev.init, init\n"
+        "end_toc:\n"
+        "\n"
+        "init:\n"
+        "    push foo+1\n"
+        "    stop\n";
+
+    Assembler a = {0};
+    assembler_init(&a, rn, src);
+
+    U16Vec bc = assemble_run(&a);
+
+    printf("%s\n", src);
+    for(int i=0;i<bc.n;i++){
+        printf("%4d %04x\n", i, bc.v[i]);
+    }
+
+    free(bc.v);
+    assembler_free(&a);
+}
+
+/* ------------------------ main ------------------------ */
+
+int main(void){
+    test(NULL);
+    return 0;
+}
