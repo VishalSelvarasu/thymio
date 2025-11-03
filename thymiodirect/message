@@ -1,0 +1,513 @@
+/* message.c — C11 port of thymiodirect.message.Message
+   SPDX-License-Identifier: BSD-3-Clause */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+/* ===================== Utilities ===================== */
+
+static void* xmalloc(size_t n){ void* p = malloc(n); if(!p){ perror("malloc"); exit(1);} return p; }
+static void* xrealloc(void* p,size_t n){ void* q = realloc(p,n); if(!q){ perror("realloc"); exit(1);} return q; }
+static char* xstrdup(const char* s){ size_t n=strlen(s)+1; char* p=xmalloc(n); memcpy(p,s,n); return p; }
+
+static uint16_t rd_u16le(const uint8_t* p){ return (uint16_t)(p[0] | (p[1]<<8)); }
+static void wr_u16le(uint8_t* p, uint16_t v){ p[0]=(uint8_t)(v&0xff); p[1]=(uint8_t)(v>>8); }
+
+/* Convert 16 raw bytes into canonical UUID string */
+static char* uuid_16_to_str(const uint8_t b[16]){
+    /* 8-4-4-4-12 = 36 chars + NUL */
+    static const int idx[] = {0,1,2,3, 4,5, 6,7, 8,9, 10,11,12,13,14,15};
+    char* s = xmalloc(37);
+    sprintf(s,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[idx[0]], b[idx[1]], b[idx[2]], b[idx[3]],
+        b[idx[4]], b[idx[5]],
+        b[idx[6]], b[idx[7]],
+        b[idx[8]], b[idx[9]],
+        b[idx[10]], b[idx[11]], b[idx[12]], b[idx[13]], b[idx[14]], b[idx[15]]);
+    return s;
+}
+
+/* ===================== Message ===================== */
+
+typedef struct {
+    uint16_t id;
+    uint16_t source_node;
+    uint16_t payload_len;
+    uint8_t* payload;          /* owned */
+    /* ---- Decoded fields (filled by Message_decode) ---- */
+
+    /* DESCRIPTION */
+    char*   node_name;
+    uint16_t protocol_version, bytecode_size, stack_size, max_var_size;
+    uint16_t num_named_var, num_local_events, num_native_fun;
+
+    /* NAMED_VARIABLE_DESCRIPTION */
+    uint16_t var_size;
+    char*    var_name;
+
+    /* LOCAL_EVENT_DESCRIPTION */
+    char* event_name;
+    char* description;
+
+    /* NATIVE_FUNCTION_DESCRIPTION */
+    char* fun_name;
+    char** param_names;
+    uint16_t* param_sizes;
+    uint16_t num_params;
+
+    /* VARIABLES */
+    uint16_t var_offset;
+    int16_t* var_data;       /* signed words */
+    uint16_t var_data_count;
+
+    /* EXECUTION_STATE_CHANGED */
+    uint16_t pc, flags;
+    bool event_active, step_by_step, event_running;
+
+    /* NODE_PRESENT */
+    uint16_t version;
+
+    /* DEVICE_INFO */
+    uint8_t device_info;     /* selector */
+    char*   device_name;
+    char*   device_uuid;     /* canonical string if 16-byte uuid present */
+    uint16_t network_id, node_id, channel;
+
+    /* SET_BYTECODE */
+    uint16_t target_node_id;
+    uint16_t bc_offset;
+    uint16_t* bc;            /* words */
+    uint16_t  bc_count;
+
+    /* BREAKPOINT_SET/CLEAR */
+    /* target_node_id reused */
+    /* pc reused */
+
+    /* GET_VARIABLES / SET_VARIABLES (outgoing decode convenience) */
+    uint16_t var_count;
+    uint16_t* var_val;       /* for SET_VARIABLES */
+
+    /* LIST_NODES / GET_NODE_DESCRIPTION_FRAGMENT */
+    uint16_t fragment;
+} Message;
+
+/* ======= Constants (copied from Python) ======= */
+enum {
+    ID_FIRST_ASEBA_ID = 0x8000,
+    ID_BOOTLOADER_RESET = 0x8000,
+    ID_BOOTLOADER_READ_PAGE = 0x8001,
+    ID_BOOTLOADER_WRITE_PAGE = 0x8002,
+    ID_BOOTLOADER_PAGE_DATA_WRITE = 0x8003,
+    ID_BOOTLOADER_DESCRIPTION = 0x8004,
+    ID_BOOTLOADER_PAGE_DATA_READ = 0x8005,
+    ID_BOOTLOADER_ACK = 0x8006,
+    ID_DESCRIPTION = 0x9000,
+    ID_NAMED_VARIABLE_DESCRIPTION = 0x9001,
+    ID_LOCAL_EVENT_DESCRIPTION = 0x9002,
+    ID_NATIVE_FUNCTION_DESCRIPTION = 0x9003,
+    ID_VARIABLES = 0x9005,
+    ID_EXECUTION_STATE_CHANGED = 0x900a,
+    ID_NODE_PRESENT = 0x900c,
+    ID_DEVICE_INFO = 0x900d,
+    ID_CHANGED_VARIABLES = 0x900e,
+    ID_GET_DESCRIPTION = 0xa000,
+    ID_SET_BYTECODE = 0xa001,
+    ID_RESET = 0xa002,
+    ID_RUN = 0xa003,
+    ID_PAUSE = 0xa004,
+    ID_STEP = 0xa005,
+    ID_STOP = 0xa006,
+    ID_GET_EXECUTION_STATE = 0xa007,
+    ID_BREAKPOINT_SET = 0xa008,
+    ID_BREAKPOINT_CLEAR = 0xa009,
+    ID_BREAKPOINT_CLEAR_ALL = 0xa00a,
+    ID_GET_VARIABLES = 0xa00b,
+    ID_SET_VARIABLES = 0xa00c,
+    ID_GET_NODE_DESCRIPTION = 0xa010,
+    ID_LIST_NODES = 0xa011,
+    /* v6 */
+    ID_GET_DEVICE_INFO = 0xa012,
+    ID_SET_DEVICE_INFO = 0xa013,
+    /* v7 */
+    ID_GET_CHANGED_VARIABLES = 0xa014,
+    /* v8 */
+    ID_GET_NODE_DESCRIPTION_FRAGMENT = 0xa015,
+
+    PROTOCOL_VERSION = 5,
+
+    DEVICE_INFO_UUID = 1,
+    DEVICE_INFO_NAME = 2,
+    DEVICE_INFO_THYMIO2_RF_SETTINGS = 3
+};
+
+/* ======= Constructors / serialization ======= */
+
+static Message Message_make(uint16_t id, uint16_t src, const uint8_t* payload, uint16_t n){
+    Message m; memset(&m, 0, sizeof(m));
+    m.id = id; m.source_node = src; m.payload_len = n;
+    if(n){ m.payload = xmalloc(n); memcpy(m.payload, payload, n); }
+    return m;
+}
+
+static void Message_free(Message* m){
+    if(!m) return;
+    free(m->payload);
+    free(m->node_name);
+    free(m->var_name);
+    free(m->event_name);
+    free(m->description);
+    free(m->fun_name);
+    if(m->param_names){
+        for(uint16_t i=0;i<m->num_params;i++) free(m->param_names[i]);
+    }
+    free(m->param_names);
+    free(m->param_sizes);
+    free(m->var_data);
+    free(m->device_name);
+    free(m->device_uuid);
+    free(m->bc);
+    free(m->var_val);
+    memset(m, 0, sizeof(*m));
+}
+
+/* Serialize frame: [len][source_node][id][payload] (all LE) */
+static uint8_t* Message_serialize(const Message* m, size_t* out_len){
+    size_t total = 2 + 2 + 2 + m->payload_len;
+    uint8_t* b = xmalloc(total);
+    wr_u16le(b+0, m->payload_len);
+    wr_u16le(b+2, m->source_node);
+    wr_u16le(b+4, m->id);
+    if(m->payload_len) memcpy(b+6, m->payload, m->payload_len);
+    *out_len = total;
+    return b;
+}
+
+/* Helpers like Python’s static methods */
+static uint8_t* Message_uint16_to_bytes(uint16_t w){
+    uint8_t* b = xmalloc(2);
+    wr_u16le(b, w);
+    return b;
+}
+static uint8_t* Message_uint16array_to_bytes(const uint16_t* a, size_t n, size_t* out_len){
+    *out_len = 2*n;
+    uint8_t* b = xmalloc(*out_len);
+    for(size_t i=0;i<n;i++) wr_u16le(b+2*i, a[i]);
+    return b;
+}
+
+/* ======= Safe payload getters (bounds-checked) ======= */
+
+typedef struct { uint32_t val; uint32_t next; bool ok; } GetU32;
+typedef struct { int32_t  val; uint32_t next; bool ok; } GetI32;
+typedef struct { char*    val; uint32_t next; bool ok; } GetStr;
+
+static GetU32 get_u8(const uint8_t* p, uint32_t n, uint32_t off){
+    GetU32 r = {0, off, false};
+    if(off+1 > n) return r;
+    r.val = p[off];
+    r.next = off+1; r.ok=true; return r;
+}
+static GetU32 get_u16(const uint8_t* p, uint32_t n, uint32_t off){
+    GetU32 r = {0, off, false};
+    if(off+2 > n) return r;
+    r.val = rd_u16le(p+off);
+    r.next = off+2; r.ok=true; return r;
+}
+static GetI32 get_i16(const uint8_t* p, uint32_t n, uint32_t off){
+    GetI32 r = {0, off, false};
+    if(off+2 > n) return r;
+    int32_t v = (int32_t)rd_u16le(p+off);
+    if(v >= 32768) v -= 65536;
+    r.val = v; r.next = off+2; r.ok=true; return r;
+}
+static GetStr get_str(const uint8_t* p, uint32_t n, uint32_t off){
+    GetStr r = {NULL, off, false};
+    if(off+1 > n) return r;
+    uint32_t len = p[off];
+    if(off+1+len > n) return r;
+    char* s = xmalloc(len+1);
+    memcpy(s, p+off+1, len);
+    s[len] = 0;
+    r.val = s; r.next = off+1+len; r.ok=true; return r;
+}
+
+/* ======= decode() ======= */
+
+static void Message_decode(Message* m){
+    const uint8_t* p = m->payload;
+    uint32_t n = m->payload_len;
+    uint32_t off = 0;
+
+    switch(m->id){
+    case ID_DESCRIPTION: {
+        GetStr s1 = get_str(p,n,0); if(!s1.ok) break;
+        m->node_name = s1.val; off = s1.next;
+        GetU32 g;
+        g = get_u16(p,n,off); if(!g.ok) break; m->protocol_version = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->bytecode_size = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->stack_size = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->max_var_size = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->num_named_var = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->num_local_events = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->num_native_fun = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_NAMED_VARIABLE_DESCRIPTION: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->var_size = (uint16_t)g.val; off=g.next;
+        GetStr s = get_str(p,n,off); if(!s.ok) break; m->var_name = s.val; off = s.next;
+        break;
+    }
+    case ID_LOCAL_EVENT_DESCRIPTION: {
+        GetStr s = get_str(p,n,0); if(!s.ok) break; m->event_name = s.val; off=s.next;
+        s = get_str(p,n,off); if(!s.ok) break; m->description = s.val; off=s.next;
+        break;
+    }
+    case ID_NATIVE_FUNCTION_DESCRIPTION: {
+        GetStr s = get_str(p,n,0); if(!s.ok) break; m->fun_name = s.val; off=s.next;
+        s = get_str(p,n,off); if(!s.ok) break; m->description = s.val; off=s.next;
+        GetU32 g = get_u16(p,n,off); if(!g.ok) break; m->num_params = (uint16_t)g.val; off=g.next;
+        if(m->num_params){
+            m->param_names = xmalloc(m->num_params * sizeof(char*));
+            m->param_sizes = xmalloc(m->num_params * sizeof(uint16_t));
+            for(uint16_t i=0;i<m->num_params;i++){
+                GetU32 sz = get_u16(p,n,off); if(!sz.ok) break; uint16_t size = (uint16_t)sz.val; off=sz.next;
+                GetStr ns = get_str(p,n,off); if(!ns.ok) break; char* name = ns.val; off = ns.next;
+                m->param_sizes[i] = size;
+                m->param_names[i] = name;
+            }
+        }
+        break;
+    }
+    case ID_VARIABLES: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->var_offset = (uint16_t)g.val; off=g.next;
+        /* remaining are int16 words */
+        uint16_t cnt = (n/2) > 0 ? (uint16_t)(n/2 - 1) : 0;
+        m->var_data_count = cnt;
+        if(cnt){
+            m->var_data = xmalloc(cnt * sizeof(int16_t));
+            for(uint16_t i=0;i<cnt;i++){
+                GetI32 gi = get_i16(p,n,off); if(!gi.ok) break;
+                m->var_data[i] = (int16_t)gi.val;
+                off = gi.next;
+            }
+        }
+        break;
+    }
+    case ID_EXECUTION_STATE_CHANGED: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->pc = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->flags = (uint16_t)g.val; off=g.next;
+        m->event_active = (m->flags & 1) != 0;
+        m->step_by_step = (m->flags & 2) != 0;
+        m->event_running = (m->flags & 4) != 0;
+        break;
+    }
+    case ID_NODE_PRESENT: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->version = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_DEVICE_INFO: {
+        GetU32 s = get_u8(p,n,0); if(!s.ok) break; m->device_info = (uint8_t)s.val; off=s.next;
+        if(m->device_info == DEVICE_INFO_NAME){
+            GetStr nm = get_str(p,n,off); if(!nm.ok) break; m->device_name = nm.val; off=nm.next;
+        }else if(m->device_info == DEVICE_INFO_UUID){
+            GetU32 dl = get_u8(p,n,off); if(!dl.ok) break; uint8_t len=(uint8_t)dl.val; off=dl.next;
+            if(off+len <= n){
+                if(len == 16){
+                    m->device_uuid = uuid_16_to_str(&p[off]);
+                }else{
+                    /* fallback: hex string without dashes */
+                    char* s = xmalloc(len*2+1);
+                    for(uint8_t i=0;i<len;i++) sprintf(s+2*i, "%02x", p[off+i]);
+                    s[len*2]=0; m->device_uuid = s;
+                }
+                off += len;
+            }
+        }else if(m->device_info == DEVICE_INFO_THYMIO2_RF_SETTINGS){
+            GetU32 dl = get_u8(p,n,off); if(!dl.ok) break; uint8_t len=(uint8_t)dl.val; off=dl.next;
+            if(len == 6){
+                GetU32 g;
+                g = get_u16(p,n,off); if(!g.ok) break; m->network_id = (uint16_t)g.val; off=g.next;
+                g = get_u16(p,n,off); if(!g.ok) break; m->node_id    = (uint16_t)g.val; off=g.next;
+                g = get_u16(p,n,off); if(!g.ok) break; m->channel    = (uint16_t)g.val; off=g.next;
+            }else{
+                /* ignore */
+                off += len;
+            }
+        }
+        break;
+    }
+    case ID_SET_BYTECODE: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->target_node_id = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->bc_offset = (uint16_t)g.val; off=g.next;
+        uint16_t cnt = (off<=n) ? (uint16_t)((n - off)/2) : 0;
+        if(cnt){
+            m->bc = xmalloc(cnt * sizeof(uint16_t));
+            m->bc_count = cnt;
+            for(uint16_t i=0;i<cnt;i++){
+                g = get_u16(p,n,off); if(!g.ok) break;
+                m->bc[i] = (uint16_t)g.val; off=g.next;
+            }
+        }
+        break;
+    }
+    case ID_BREAKPOINT_CLEAR_ALL:
+    case ID_RESET:
+    case ID_RUN:
+    case ID_PAUSE:
+    case ID_STEP:
+    case ID_STOP:
+    case ID_GET_EXECUTION_STATE: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->target_node_id = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_BREAKPOINT_SET:
+    case ID_BREAKPOINT_CLEAR: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->target_node_id = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->pc = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_GET_VARIABLES: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->target_node_id = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->var_offset = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->var_count  = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_SET_VARIABLES: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->target_node_id = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->var_offset = (uint16_t)g.val; off=g.next;
+        uint16_t cnt = (off<=n)? (uint16_t)((n - off)/2) : 0;
+        if(cnt){
+            m->var_val = xmalloc(cnt * sizeof(uint16_t));
+            for(uint16_t i=0;i<cnt;i++){
+                g = get_u16(p,n,off); if(!g.ok) break;
+                m->var_val[i] = (uint16_t)g.val; off=g.next;
+            }
+        }
+        break;
+    }
+    case ID_LIST_NODES: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->version = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    case ID_GET_NODE_DESCRIPTION_FRAGMENT: {
+        GetU32 g = get_u16(p,n,0); if(!g.ok) break; m->version = (uint16_t)g.val; off=g.next;
+        g = get_u16(p,n,off); if(!g.ok) break; m->fragment = (uint16_t)g.val; off=g.next;
+        break;
+    }
+    default:
+        if(m->id < ID_FIRST_ASEBA_ID){
+            /* user event: payload is u16 array */
+            /* If you need it, parse externally: here we leave raw payload */
+        }
+        break;
+    }
+}
+
+/* ======= id_to_str (like Python) ======= */
+
+static const char* Message_id_to_str(uint16_t id){
+    switch(id){
+        case ID_DESCRIPTION: return "DESCRIPTION";
+        case ID_NAMED_VARIABLE_DESCRIPTION: return "ID_NAMED_VARIABLE_DESCRIPTION";
+        case ID_LOCAL_EVENT_DESCRIPTION: return "ID_LOCAL_EVENT_DESCRIPTION";
+        case ID_NATIVE_FUNCTION_DESCRIPTION: return "ID_NATIVE_FUNCTION_DESCRIPTION";
+        case ID_VARIABLES: return "ID_VARIABLES";
+        case ID_EXECUTION_STATE_CHANGED: return "ID_EXECUTION_STATE_CHANGED";
+        case ID_NODE_PRESENT: return "ID_NODE_PRESENT";
+        case ID_GET_DESCRIPTION: return "ID_GET_DESCRIPTION";
+        case ID_SET_BYTECODE: return "ID_SET_BYTECODE";
+        case ID_RESET: return "ID_RESET";
+        case ID_RUN: return "ID_RUN";
+        case ID_PAUSE: return "ID_PAUSE";
+        case ID_STEP: return "ID_STEP";
+        case ID_STOP: return "ID_STOP";
+        case ID_GET_EXECUTION_STATE: return "ID_GET_EXECUTION_STATE";
+        case ID_BREAKPOINT_SET: return "ID_BREAKPOINT_SET";
+        case ID_BREAKPOINT_CLEAR: return "ID_BREAKPOINT_CLEAR";
+        case ID_BREAKPOINT_CLEAR_ALL: return "ID_BREAKPOINT_CLEAR_ALL";
+        case ID_GET_VARIABLES: return "ID_GET_VARIABLES";
+        case ID_SET_VARIABLES: return "ID_SET_VARIABLES";
+        case ID_GET_NODE_DESCRIPTION: return "ID_GET_NODE_DESCRIPTION";
+        case ID_LIST_NODES: return "ID_LIST_NODES";
+        case ID_GET_DEVICE_INFO: return "ID_GET_DEVICE_INFO";
+        case ID_SET_DEVICE_INFO: return "ID_SET_DEVICE_INFO";
+        case ID_GET_CHANGED_VARIABLES: return "ID_GET_CHANGED_VARIABLES";
+        case ID_GET_NODE_DESCRIPTION_FRAGMENT: return "ID_GET_NODE_DESCRIPTION_FRAGMENT";
+        default: ;
+    }
+    static char buf[32];
+    snprintf(buf, sizeof(buf), "ID %u", id);
+    return buf;
+}
+
+/* ======= toString-ish pretty print (optional) ======= */
+
+static void Message_dump(const Message* m, FILE* out){
+    fprintf(out, "Message id=%s src=%u", Message_id_to_str(m->id), m->source_node);
+    switch(m->id){
+        case ID_DESCRIPTION:
+            fprintf(out, " name=%s vers=%u bc_size=%u stack_size=%u max_var_size=%u #var=%u #ev=%u #nat=%u",
+                m->node_name?m->node_name:"", m->protocol_version, m->bytecode_size, m->stack_size,
+                m->max_var_size, m->num_named_var, m->num_local_events, m->num_native_fun);
+            break;
+        case ID_NAMED_VARIABLE_DESCRIPTION:
+            fprintf(out, " name=%s size=%u", m->var_name?m->var_name:"", m->var_size);
+            break;
+        case ID_LOCAL_EVENT_DESCRIPTION:
+            fprintf(out, " name=%s descr=%s", m->event_name?m->event_name:"", m->description?m->description:"");
+            break;
+        case ID_NATIVE_FUNCTION_DESCRIPTION: {
+            fprintf(out, " name=%s descr=%s p=(",
+                m->fun_name?m->fun_name:"", m->description?m->description:"");
+            for(uint16_t i=0;i<m->num_params;i++){
+                uint16_t sz = m->param_sizes?m->param_sizes[i]:0;
+                fprintf(out, "%s[%s],", m->param_names?m->param_names[i]:"", (sz!=65535)? (char[8]){0} : "?");
+                /* quick size print */
+            }
+            fprintf(out, ")");
+            break;
+        }
+        case ID_VARIABLES: {
+            fprintf(out, " offset=%u data=(", m->var_offset);
+            for(uint16_t i=0;i<m->var_data_count;i++) fprintf(out, "%d,", (int)m->var_data[i]);
+            fprintf(out, ")");
+            break;
+        }
+        case ID_EXECUTION_STATE_CHANGED:
+            fprintf(out, " pc=%u event_active=%d step_by_step=%d event_running=%d",
+                m->pc, (int)m->event_active, (int)m->step_by_step, (int)m->event_running);
+            break;
+        case ID_NODE_PRESENT:
+            fprintf(out, " version=%u", m->version);
+            break;
+        default: break;
+    }
+    fprintf(out, "\n");
+}
+
+/* ======= Tiny demo (remove if you embed elsewhere) ======= */
+#ifdef MESSAGE_DEMO_MAIN
+int main(void){
+    /* Build a DESCRIPTION payload to test */
+    uint8_t pl[64]; size_t off=0;
+    /* name "thymio" */
+    pl[off++] = 6; memcpy(pl+off,"thymio",6); off+=6;
+    /* protocol..num_native_fun (7 u16) */
+    uint16_t words[] = {5, 1024, 64, 2048, 3, 2, 7};
+    for(size_t i=0;i<7;i++){ wr_u16le(pl+off, words[i]); off+=2; }
+
+    Message m = Message_make(ID_DESCRIPTION, 1, pl, (uint16_t)off);
+    Message_decode(&m);
+    Message_dump(&m, stdout);
+    size_t n=0; uint8_t* frame = Message_serialize(&m, &n);
+    fprintf(stderr, "serialized frame bytes=%zu\n", n);
+    free(frame);
+    Message_free(&m);
+    return 0;
+}
+#endif
