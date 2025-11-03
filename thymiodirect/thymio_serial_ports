@@ -1,0 +1,167 @@
+// thymio_serial_ports.c
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// C11 port of thymiodirect.thymio_serial_ports.ThymioSerialPort
+// Enumerates Thymio serial ports by USB VID/PID using libserialport.
+// Falls back to returning all serial ports if USB info isn’t available.
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include <libserialport.h>   // https://sigrok.org/wiki/Libserialport
+
+/* ---------------------- Constants (match Python) ---------------------- */
+#define USB_VID_EPFL            0x0617
+#define USB_PID_THYMIO          0x000A
+#define USB_PID_THYMIO_WIRELESS 0x000C
+
+/* ---------------------- Data structures & API ------------------------ */
+
+typedef struct {
+    char  *device;    // e.g. "/dev/ttyACM0", "COM5", "/dev/cu.usbmodem..."
+    bool   wireless;  // true if PID == 0x000C
+    bool   is_thymio;// true if VID/PID matched
+} ThymioSerialPort;
+
+/**
+ * Enumerate ports that look like Thymio devices. If none found (or no USB
+ * metadata available), returns all serial ports (with is_thymio=false).
+ *
+ * Return value: number of entries placed into *out (heap-allocated array).
+ * Caller must free: for each item free(item.device), then free(array).
+ */
+size_t thymio_get_ports(ThymioSerialPort **out);
+
+/** Convenience: return strdup of the first device path, or NULL if none. */
+char *thymio_default_device(void);
+
+/* --------------------------- Implementation -------------------------- */
+
+static void free_ports(ThymioSerialPort *arr, size_t n){
+    if(!arr) return;
+    for(size_t i=0;i<n;i++) free(arr[i].device);
+    free(arr);
+}
+
+static ThymioSerialPort make_port(const char *name, bool wireless, bool is_thymio){
+    ThymioSerialPort p = {0};
+    p.device   = name ? strdup(name) : NULL;
+    p.wireless = wireless;
+    p.is_thymio= is_thymio;
+    return p;
+}
+
+static size_t list_all_ports(ThymioSerialPort **out){
+    *out = NULL;
+    struct sp_port **ports = NULL;
+    enum sp_return r = sp_list_ports(&ports);
+    if(r != SP_OK) return 0;
+
+    size_t count = 0;
+    for(struct sp_port **pp = ports; pp && *pp; ++pp) count++;
+
+    ThymioSerialPort *arr = (ThymioSerialPort*)calloc(count, sizeof(*arr));
+    size_t i = 0;
+    for(struct sp_port **pp = ports; pp && *pp; ++pp){
+        const char *name = sp_get_port_name(*pp);
+        arr[i++] = make_port(name, /*wireless*/false, /*is_thymio*/false);
+    }
+    sp_free_port_list(ports);
+    *out = arr;
+    return count;
+}
+
+size_t thymio_get_ports(ThymioSerialPort **out){
+    *out = NULL;
+
+    struct sp_port **ports = NULL;
+    enum sp_return r = sp_list_ports(&ports);
+    if(r != SP_OK){
+        // Couldn’t enumerate; nothing we can do.
+        return 0;
+    }
+
+    // First pass: collect only bona fide Thymio (by VID/PID)
+    ThymioSerialPort *hits = NULL;
+    size_t nhits = 0, cap = 0;
+
+    for(struct sp_port **pp = ports; pp && *pp; ++pp){
+        struct sp_port *p = *pp;
+        const char *name = sp_get_port_name(p);
+
+        // Try to get USB VID/PID (transport must be USB)
+        enum sp_transport trans = sp_get_port_transport(p);
+        if(trans == SP_TRANSPORT_USB){
+            int vid = 0, pid = 0;
+            // libserialport returns SP_OK on success; values are ints
+            if(sp_get_port_usb_vid_pid(p, &vid, &pid) == SP_OK){
+                bool thymio = (vid == USB_VID_EPFL) &&
+                              (pid == USB_PID_THYMIO || pid == USB_PID_THYMIO_WIRELESS);
+                if(thymio){
+                    bool wireless = (pid == USB_PID_THYMIO_WIRELESS);
+                    if(nhits == cap){
+                        cap = cap ? cap*2 : 8;
+                        hits = (ThymioSerialPort*)realloc(hits, cap*sizeof(*hits));
+                    }
+                    hits[nhits++] = make_port(name, wireless, true);
+                }
+            }
+        }
+    }
+
+    // If we found at least one Thymio, return only those (like Python’s “recognized” list)
+    if(nhits > 0){
+        sp_free_port_list(ports);
+        *out = hits;
+        return nhits;
+    }
+
+    // Else: fallback – return all serial ports (platform supported but no matches)
+    sp_free_port_list(ports);
+    free_ports(hits, nhits);
+    return list_all_ports(out);
+}
+
+char *thymio_default_device(void){
+    ThymioSerialPort *ports = NULL;
+    size_t n = thymio_get_ports(&ports);
+    if(n == 0) return NULL;
+    char *d = ports[0].device ? strdup(ports[0].device) : NULL;
+    free_ports(ports, n);
+    return d;
+}
+
+/* ------------------------------ Demo --------------------------------- */
+#ifdef THYMIO_SERIAL_PORTS_DEMO_MAIN
+int main(void){
+    ThymioSerialPort *ports = NULL;
+    size_t n = thymio_get_ports(&ports);
+
+    if(n == 0){
+        printf("No serial ports found.\n");
+        return 0;
+    }
+
+    for(size_t i=0;i<n;i++){
+        printf("%s%s (%s)\n",
+               ports[i].is_thymio ? "Thymio" : "Serial port",
+               (ports[i].is_thymio && ports[i].wireless) ? " wireless" : "",
+               ports[i].device ? ports[i].device : "?");
+    }
+
+    char *def = thymio_default_device();
+    if(def){
+        printf("Default device: %s\n", def);
+        free(def);
+    }
+
+    // cleanup
+    for(size_t i=0;i<n;i++) free(ports[i].device);
+    free(ports);
+    return 0;
+}
+#endif
