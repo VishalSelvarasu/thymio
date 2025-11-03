@@ -1,0 +1,121 @@
+// This file is part of thymiodirect.
+// Copyright 2020 ECOLE POLYTECHNIQUE FEDERALE DE LAUSANNE,
+// Miniature Mobile Robots group, Switzerland
+// Author: Yves Piguet
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
+/*
+Communication with Thymio II robot
+==================================
+
+This module provides support to connect to a Thymio II robot with its native
+binary protocol via a serial port (virtual port over a wired USB or wireless
+USB dongle) or a TCP port (asebaswitch or Thymio simulator).
+
+Example
+-------
+
+// import the required classes
+// from thymiodirect.thymio_serial_ports import ThymioSerialPort
+// from thymiodirect import Thymio
+
+// get the serial port the Thymio is connected to
+// (depending on your configuration, the default port is not what you want)
+// port = ThymioSerialPort.default_device()
+
+// create a Thymio connection object with a callback to be notified when
+// the robot is ready and start the connection (or just wait a few seconds)
+// th = Thymio(serial_port=port,
+//             on_connect=lambda node_id:printf("%d is connected\n", node_id));
+// th.connect()
+
+// get id of the first (or only) Thymio
+// id = th.first_node()
+
+// get a variable
+// th[id]["prox.horizontal"]
+
+// set a variable (scalar or array)
+// th[id]["leds.top"] = [0, 0, 32]
+
+// define a function called after new variable values have been fetched
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+// Dummy definitions to simulate Thymio API in C
+
+typedef struct {
+    int prox_horizontal[7];
+    int leds_top[3];
+    int motor_left_target;
+    int motor_right_target;
+    bool button_center;
+} ThymioNode;
+
+typedef void (*VariableObserver)(int node_id);
+
+typedef struct {
+    ThymioNode node;
+    VariableObserver observer;
+    int id;
+} Thymio;
+
+int prox_prev = 0;
+
+void obs(Thymio *th, int node_id) {
+    int prox = (th->node.prox_horizontal[5] - th->node.prox_horizontal[2]) / 10;
+    if (prox != prox_prev) {
+        th->node.motor_left_target = prox;
+        th->node.motor_right_target = prox;
+        printf("%d\n", prox);
+        if (prox > 5) {
+            th->node.leds_top[0] = 0;
+            th->node.leds_top[1] = 32;
+            th->node.leds_top[2] = 0;
+        } else if (prox < -5) {
+            th->node.leds_top[0] = 32;
+            th->node.leds_top[1] = 32;
+            th->node.leds_top[2] = 0;
+        } else if (prox > -3 && prox < 3) {
+            th->node.leds_top[0] = 0;
+            th->node.leds_top[1] = 0;
+            th->node.leds_top[2] = 32;
+        }
+        prox_prev = prox;
+    }
+    if (th->node.button_center) {
+        printf("button.center\n");
+        exit(0); // forced exit despite coroutines
+    }
+}
+
+void set_variable_observer(Thymio *th, VariableObserver observer) {
+    th->observer = observer;
+}
+
+int main() {
+    Thymio th = {0};
+    th.id = 1;
+
+    // Simulate some sensor values
+    th.node.prox_horizontal[2] = 10;
+    th.node.prox_horizontal[5] = 70;
+    th.node.button_center = false;
+
+    set_variable_observer(&th, (VariableObserver)obs);
+
+    // Simulate variable update loop
+    while (1) {
+        if (th.observer) {
+            th.observer(&th, th.id);
+        }
+        // For demonstration, break after one iteration
+        break;
+    }
+
+    return 0;
+}
