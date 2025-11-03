@@ -1,0 +1,446 @@
+// thymio.c — C11 port of the Python Thymio helper
+// SPDX-License-Identifier: BSD-3-Clause
+
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+
+/* --- External modules (provide these headers/impls) --- */
+// Message IDs & types are used inside Connection/Assembler.
+typedef struct Connection Connection;
+typedef struct RemoteNode RemoteNode;
+
+/* Connection API (compatible with the C port I provided earlier) */
+Connection* connection_tcp(const char* host, uint16_t port, int host_node_id, bool debug);
+Connection* connection_null(int host_node_id);
+void        connection_shutdown(Connection*);
+void        connection_set_refreshing_rate(Connection*, double rate_sec);
+void        connection_set_refreshing_coverage(Connection*, const char** names, size_t count);
+void        connection_handshake(Connection*);
+int         connection_one_remote_node_id(Connection*);
+
+/* Wire up callbacks by storing function pointers on Connection (as in earlier port) */
+typedef void (*OnConnectionChanged)(Connection*, int node_id, bool connected);
+typedef void (*OnVariablesReceived)(Connection*, int node_id);
+typedef void (*OnUserEvent)(Connection*, int node_id, uint16_t event_id, const uint16_t* args, size_t nargs);
+typedef void (*OnCommError)(Connection*, const char* errmsg);
+
+struct Connection {
+  /* ... internal fields ... */
+  OnConnectionChanged on_connection_changed;
+  OnVariablesReceived on_variables_received;
+  OnUserEvent         on_user_event;
+  OnCommError         on_comm_error;
+
+  /* expose nodes map for read-only access to RemoteNode state */
+  struct { int* keys; RemoteNode* vals; size_t n, cap; } nodes;
+};
+
+/* RemoteNode API (subset) */
+struct RemoteNode {
+  int node_id;
+  char** named_variables; size_t named_variables_count;
+  /* name->offset/size maps are not exposed here; provide getters: */
+  // For simplicity, we assume helpers exist; otherwise we add thin wrappers below.
+  /* Local events & native functions */
+  char** local_events; size_t local_events_count;
+  char** native_functions; size_t native_functions_count;
+  /* name -> arg sizes: let’s expose via helper */
+  /* Variable storage */
+  uint16_t var_total_size;
+};
+
+/* Connection helpers mirroring Python */
+void connection_list_nodes(Connection*);
+void connection_get_variables(Connection*, int node, uint16_t off, int len);
+void connection_set_variables(Connection*, int node, uint16_t off, const uint16_t* chunk, size_t n);
+void connection_set_bytecode(Connection*, int node, const uint16_t* bc, size_t n_words, uint16_t addr);
+void connection_run(Connection*, int node);
+
+/* Accessors you likely have (if not, implement in your C RemoteNode module) */
+uint16_t rn_var_offset(RemoteNode*, const char* name);     // throws/aborts on missing
+uint16_t rn_var_size(RemoteNode*, const char* name);       // "
+uint16_t rn_get_var(RemoteNode*, const char* name, uint16_t index);
+void     rn_get_var_array(RemoteNode*, const char* name, uint16_t* out, size_t n); // fills n = var size
+
+/* Assembler API (from earlier C port) */
+typedef struct Assembler Assembler;
+Assembler* assembler_new(RemoteNode* rn, const char* src_utf8);
+void       assembler_free(Assembler*);
+typedef struct { uint16_t* words; size_t count; } Bytecode;
+Bytecode   assembler_assemble(Assembler*);
+
+/* ================= small utilities ================= */
+
+static void* xmalloc(size_t n){ void* p = malloc(n); if(!p){ perror("malloc"); exit(1);} return p; }
+static char* xstrdup(const char* s){ size_t n=strlen(s)+1; char* p=xmalloc(n); memcpy(p,s,n); return p; }
+
+/* dynamic int set (node ids) */
+typedef struct { int* v; size_t n, cap; } IntSet;
+static bool is_in(const IntSet* s, int x){ for(size_t i=0;i<s->n;i++) if(s->v[i]==x) return true; return false; }
+static void iset_add(IntSet* s, int x){ if(is_in(s,x)) return; if(s->n==s->cap){ s->cap = s->cap? s->cap*2:8; s->v = realloc(s->v, s->cap*sizeof(int)); } s->v[s->n++] = x; }
+static void iset_remove(IntSet* s, int x){ for(size_t i=0;i<s->n;i++) if(s->v[i]==x){ s->v[i]=s->v[s->n-1]; s->n--; return; } }
+
+/* simple map node_id -> callback pointer */
+typedef void (*VarObserverFn)(int node_id);
+typedef void (*UserEventListenerFn)(int node_id, int event_id, const int* args, size_t nargs);
+typedef struct { int key; VarObserverFn fn; } VarObsEntry;
+typedef struct { VarObsEntry* v; size_t n, cap; } VarObsMap;
+static void varobs_set(VarObsMap* m, int key, VarObserverFn fn){
+  for(size_t i=0;i<m->n;i++) if(m->v[i].key==key){ m->v[i].fn=fn; return; }
+  if(m->n==m->cap){ m->cap=m->cap? m->cap*2:8; m->v=realloc(m->v,m->cap*sizeof(*m->v)); }
+  m->v[m->n++] = (VarObsEntry){ key, fn };
+}
+static VarObserverFn varobs_get(const VarObsMap* m, int key){
+  for(size_t i=0;i<m->n;i++) if(m->v[i].key==key) return m->v[i].fn;
+  return NULL;
+}
+typedef struct { int key; UserEventListenerFn fn; } UELntry;
+typedef struct { UELntry* v; size_t n, cap; } UEMap;
+static void uemap_set(UEMap* m, int key, UserEventListenerFn fn){
+  for(size_t i=0;i<m->n;i++) if(m->v[i].key==key){ m->v[i].fn=fn; return; }
+  if(m->n==m->cap){ m->cap=m->cap? m->cap*2:8; m->v=realloc(m->v,m->cap*sizeof(*m->v)); }
+  m->v[m->n++] = (UELntry){ key, fn };
+}
+static UserEventListenerFn uemap_get(const UEMap* m, int key){
+  for(size_t i=0;i<m->n;i++) if(m->v[i].key==key) return m->v[i].fn;
+  return NULL;
+}
+
+/* ================= Thymio helper ================= */
+
+typedef struct {
+  /* config */
+  bool     use_tcp;
+  char*    serial_port;       /* not wired in this minimal C port */
+  char*    host;
+  uint16_t tcp_port;
+  double   refreshing_rate;
+  const char** refreshing_coverage; size_t refreshing_coverage_count;
+  double   discover_rate;     /* not used explicitly — handled by Connection if needed */
+
+  /* callbacks (synchronous) */
+  void (*on_connect)(int node_id);
+  void (*on_disconnect)(int node_id);
+  void (*on_comm_error)(const char* errmsg);
+
+  /* runtime */
+  pthread_t thread;
+  bool      running;
+  Connection* conn;
+  IntSet   nodes;
+
+  VarObsMap var_observers;
+  UEMap     user_event_listeners;
+
+  pthread_mutex_t mu;
+} Thymio;
+
+/* ---- Connection callbacks ---- */
+static void cb_conn_changed(Connection* c, int node_id, bool connected){
+  (void)c;
+  Thymio* t = NULL; /* we’ll store Thymio* inside Connection if you expose it; here we scan… */
+  /* Quick & dirty: rely on a global registry if needed. For simplicity,
+     assume one Thymio instance. */
+  extern Thymio* g_active_thymio;
+  t = g_active_thymio;
+  if(!t) return;
+
+  pthread_mutex_lock(&t->mu);
+  if(connected){
+    iset_add(&t->nodes, node_id);
+    if(t->on_connect) t->on_connect(node_id);
+  }else{
+    iset_remove(&t->nodes, node_id);
+    if(t->on_disconnect) t->on_disconnect(node_id);
+  }
+  pthread_mutex_unlock(&t->mu);
+}
+
+static void cb_vars_received(Connection* c, int node_id){
+  (void)c;
+  extern Thymio* g_active_thymio; Thymio* t = g_active_thymio; if(!t) return;
+  pthread_mutex_lock(&t->mu);
+  VarObserverFn fn = varobs_get(&t->var_observers, node_id);
+  pthread_mutex_unlock(&t->mu);
+  if(fn) fn(node_id);
+}
+
+static void cb_user_event(Connection* c, int node_id, uint16_t event_id, const uint16_t* args, size_t nargs){
+  (void)c;
+  extern Thymio* g_active_thymio; Thymio* t = g_active_thymio; if(!t) return;
+  pthread_mutex_lock(&t->mu);
+  UserEventListenerFn fn = uemap_get(&t->user_event_listeners, node_id);
+  pthread_mutex_unlock(&t->mu);
+  if(fn){
+    /* convert to signed int like Python user_event_arg */
+    int* a = nargs? (int*)xmalloc(sizeof(int)*nargs): NULL;
+    for(size_t i=0;i<nargs;i++) a[i] = (int)args[i];
+    fn(node_id, (int)event_id, a, nargs);
+    free(a);
+  }
+}
+
+static void cb_comm_error(Connection* c, const char* err){
+  (void)c;
+  extern Thymio* g_active_thymio; Thymio* t = g_active_thymio; if(!t) return;
+  if(t->on_comm_error) t->on_comm_error(err);
+}
+
+/* Global pointer for callback bridging (simplify demo) */
+Thymio* g_active_thymio = NULL;
+
+/* ---- background thread ---- */
+static void* thymio_thread_main(void* arg){
+  Thymio* t = (Thymio*)arg;
+  g_active_thymio = t;
+
+  /* open connection */
+  if(t->use_tcp){
+    t->conn = connection_tcp(t->host ? t->host : "127.0.0.1",
+                             t->tcp_port? t->tcp_port : 33333,
+                             /*host_node_id*/1, /*debug*/false);
+  }else{
+    t->conn = connection_null(1); /* replace with serial if you wire it */
+  }
+
+  /* callbacks */
+  t->conn->on_connection_changed = cb_conn_changed;
+  t->conn->on_variables_received = cb_vars_received;
+  t->conn->on_user_event         = cb_user_event;
+  t->conn->on_comm_error         = cb_comm_error;
+
+  /* auto-refresh */
+  connection_set_refreshing_rate(t->conn, t->refreshing_rate>0? t->refreshing_rate : 0.1);
+  if(t->refreshing_coverage && t->refreshing_coverage_count>0){
+    connection_set_refreshing_coverage(t->conn, t->refreshing_coverage, t->refreshing_coverage_count);
+  }
+
+  /* handshake & keep alive */
+  connection_handshake(t->conn);
+
+  /* Idle loop; Connection owns its own threads. */
+  while(t->running) sleep(1);
+
+  connection_shutdown(t->conn);
+  t->conn = NULL;
+  return NULL;
+}
+
+/* ================= Public API ================= */
+
+Thymio* thymio_new(bool use_tcp,
+                   const char* serial_port,
+                   const char* host,
+                   uint16_t tcp_port,
+                   void (*on_connect)(int),
+                   void (*on_disconnect)(int),
+                   void (*on_comm_error)(const char*),
+                   double refreshing_rate,
+                   const char** refreshing_coverage, size_t refreshing_coverage_count,
+                   double discover_rate /*unused here*/){
+  Thymio* t = (Thymio*)xmalloc(sizeof(*t));
+  memset(t,0,sizeof(*t));
+  t->use_tcp = use_tcp;
+  t->serial_port = serial_port? xstrdup(serial_port): NULL;
+  t->host = host? xstrdup(host): NULL;
+  t->tcp_port = tcp_port? tcp_port : 33333;
+  t->on_connect = on_connect;
+  t->on_disconnect = on_disconnect;
+  t->on_comm_error = on_comm_error;
+  t->refreshing_rate = (refreshing_rate>0)? refreshing_rate : 0.1;
+  t->refreshing_coverage = refreshing_coverage;
+  t->refreshing_coverage_count = refreshing_coverage_count;
+  t->discover_rate = discover_rate;
+  pthread_mutex_init(&t->mu, NULL);
+  return t;
+}
+
+void thymio_free(Thymio* t){
+  if(!t) return;
+  free(t->serial_port);
+  free(t->host);
+  free(t->nodes.v);
+  free(t->var_observers.v);
+  free(t->user_event_listeners.v);
+  pthread_mutex_destroy(&t->mu);
+  free(t);
+}
+
+void thymio_connect(Thymio* t, void (*progress)(void), double delay_sec){
+  if(!progress) progress = NULL;
+  t->running = true;
+  pthread_create(&t->thread, NULL, thymio_thread_main, t);
+
+  /* wait until at least one node is connected (like Python) */
+  const int max_wait_iters = 5000; /* 500s max if delay=0.1 */
+  int it=0;
+  while(it++ < max_wait_iters){
+    pthread_mutex_lock(&t->mu);
+    size_t n = t->nodes.n;
+    pthread_mutex_unlock(&t->mu);
+    if(n>0) break;
+    if(progress) progress();
+    struct timespec ts = { .tv_sec = (time_t)delay_sec, .tv_nsec = (long)((delay_sec - (time_t)delay_sec)*1e9) };
+    nanosleep(&ts,NULL);
+  }
+}
+
+void thymio_disconnect(Thymio* t){
+  if(!t || !t->running) return;
+  t->running = false;
+  pthread_join(t->thread, NULL);
+}
+
+size_t thymio_nodes(Thymio* t, int* out, size_t cap){
+  pthread_mutex_lock(&t->mu);
+  size_t n = t->nodes.n < cap ? t->nodes.n : cap;
+  for(size_t i=0;i<n;i++) out[i] = t->nodes.v[i];
+  pthread_mutex_unlock(&t->mu);
+  return n;
+}
+
+int thymio_first_node(Thymio* t){
+  pthread_mutex_lock(&t->mu);
+  int id = (t->nodes.n>0) ? t->nodes.v[0] : -1;
+  pthread_mutex_unlock(&t->mu);
+  return id;
+}
+
+/* Access to RemoteNode lists/info */
+static RemoteNode* find_node(Connection* c, int node_id){
+  for(size_t i=0;i<c->nodes.n;i++) if(c->nodes.keys[i]==node_id) return &c->nodes.vals[i];
+  return NULL;
+}
+
+size_t thymio_variables(Thymio* t, int node_id, const char** out, size_t cap){
+  if(!t->conn) return 0;
+  RemoteNode* rn = find_node(t->conn, node_id);
+  if(!rn) return 0;
+  size_t n = rn->named_variables_count < cap ? rn->named_variables_count : cap;
+  for(size_t i=0;i<n;i++) out[i] = rn->named_variables[i];
+  return rn->named_variables_count; /* total size */
+}
+
+uint16_t thymio_variable_size(Thymio* t, int node_id, const char* name){
+  RemoteNode* rn = find_node(t->conn, node_id);
+  return rn ? rn_var_size(rn, name) : 0;
+}
+
+uint16_t thymio_variable_offset(Thymio* t, int node_id, const char* name){
+  RemoteNode* rn = find_node(t->conn, node_id);
+  return rn ? rn_var_offset(rn, name) : 0;
+}
+
+/* Get/set variable values (Python’s __getitem__/__setitem__) */
+
+bool thymio_get_var_any(Thymio* t, int node_id, const char* name, int* out, size_t* out_len){
+  RemoteNode* rn = find_node(t->conn, node_id);
+  if(!rn) return false;
+  uint16_t sz = rn_var_size(rn, name);
+  if(sz == 1){
+    out[0] = (int)rn_get_var(rn, name, 0);
+    *out_len = 1;
+  }else{
+    uint16_t* tmp = (uint16_t*)xmalloc(sizeof(uint16_t)*sz);
+    rn_get_var_array(rn, name, tmp, sz);
+    for(uint16_t i=0;i<sz;i++) out[i] = (int)tmp[i];
+    *out_len = sz;
+    free(tmp);
+  }
+  return true;
+}
+
+bool thymio_set_var_any(Thymio* t, int node_id, const char* name, const int* vals, size_t nvals){
+  RemoteNode* rn = find_node(t->conn, node_id); if(!rn) return false;
+  uint16_t off = rn_var_offset(rn, name);
+  uint16_t sz  = rn_var_size(rn, name);
+  size_t cnt = nvals < sz ? nvals : sz;
+  uint16_t* u = (uint16_t*)xmalloc(sizeof(uint16_t)*cnt);
+  for(size_t i=0;i<cnt;i++) u[i] = (uint16_t)vals[i];
+  connection_set_variables(t->conn, node_id, off, u, cnt);
+  free(u);
+  return true;
+}
+
+/* Observers/listeners */
+void thymio_set_variable_observer(Thymio* t, int node_id, VarObserverFn fn){
+  pthread_mutex_lock(&t->mu);
+  varobs_set(&t->var_observers, node_id, fn);
+  pthread_mutex_unlock(&t->mu);
+}
+void thymio_set_user_event_listener(Thymio* t, int node_id, UserEventListenerFn fn){
+  pthread_mutex_lock(&t->mu);
+  uemap_set(&t->user_event_listeners, node_id, fn);
+  pthread_mutex_unlock(&t->mu);
+}
+
+/* Events / native functions listing (names only) */
+size_t thymio_events(Thymio* t, int node_id, const char** out, size_t cap){
+  RemoteNode* rn = find_node(t->conn, node_id); if(!rn) return 0;
+  size_t n = rn->local_events_count < cap ? rn->local_events_count : cap;
+  for(size_t i=0;i<n;i++) out[i] = rn->local_events[i];
+  return rn->local_events_count;
+}
+size_t thymio_native_functions(Thymio* t, int node_id, const char** out, size_t cap){
+  RemoteNode* rn = find_node(t->conn, node_id); if(!rn) return 0;
+  size_t n = rn->native_functions_count < cap ? rn->native_functions_count : cap;
+  for(size_t i=0;i<n;i++) out[i] = rn->native_functions[i];
+  return rn->native_functions_count;
+}
+
+/* Assemble + run (like run_asm) */
+bool thymio_run_asm(Thymio* t, int node_id, const char* asm_src_utf8){
+  RemoteNode* rn = find_node(t->conn, node_id); if(!rn) return false;
+  Assembler* a = assembler_new(rn, asm_src_utf8);
+  if(!a) return false;
+  Bytecode bc = assembler_assemble(a);
+  assembler_free(a);
+  if(!bc.words || !bc.count) return false;
+  connection_set_bytecode(t->conn, node_id, bc.words, bc.count, /*address*/0);
+  connection_run(t->conn, node_id);
+  free(bc.words);
+  return true;
+}
+
+/* Device names (if you expose them on RemoteNode, add getters here).
+   For brevity, omitted; you can extend RemoteNode to hold device_name and expose getters. */
+
+/* ================= Demo (optional) ================= */
+#ifdef THYMIO_DEMO_MAIN
+static void on_connect(int id){ printf("[host] node %d connected\n", id); }
+static void on_disconnect(int id){ printf("[host] node %d disconnected\n", id); }
+static void on_err(const char* e){ fprintf(stderr,"[host] comm error: %s\n", e); }
+static void on_vars(int id){ printf("[host] vars updated for %d\n", id); }
+static void on_user(int id, int ev, const int* args, size_t n){
+  printf("[host] user event %d from %d (nargs=%zu)\n", ev, id, n);
+}
+
+int main(void){
+  Thymio* t = thymio_new(/*use_tcp*/true, NULL, "127.0.0.1", 33333,
+                         on_connect, on_disconnect, on_err,
+                         /*refresh*/0.1, NULL, 0, /*discover*/2.0);
+  thymio_connect(t, NULL, 0.1);
+
+  int node = thymio_first_node(t);
+  if(node >= 0){
+    printf("first node: %d\n", node);
+    const char* prog =
+      "init:\n"
+      "  push.s 1\n"
+      "  stop\n";
+    thymio_run_asm(t, node, prog);
+  }
+
+  sleep(3);
+  thymio_disconnect(t);
+  thymio_free(t);
+  return 0;
+}
+#endif
