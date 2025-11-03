@@ -1,0 +1,812 @@
+// thymio_connection.c
+// C11 port of thymiodirect Connection / RemoteNode / InputThread
+// SPDX-License-Identifier: BSD-3-Clause
+
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdnoreturn.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* =============================== Utilities =============================== */
+
+static void* xmalloc(size_t n){ void* p = malloc(n); if(!p){ perror("malloc"); exit(1);} return p; }
+static void* xrealloc(void* p,size_t n){ void* q=realloc(p,n); if(!q){ perror("realloc"); exit(1);} return q; }
+static char* xstrdup(const char* s){ size_t n=strlen(s)+1; char* p=xmalloc(n); memcpy(p,s,n); return p; }
+
+static uint16_t rd_u16le(const uint8_t* p){ return (uint16_t)(p[0] | (p[1]<<8)); }
+static void wr_u16le(uint8_t* p, uint16_t v){ p[0]=(uint8_t)(v&0xff); p[1]=(uint8_t)(v>>8); }
+
+/* =============================== Message =============================== */
+/* Minimal framing compatible with your Python read/write:
+   [u16 payload_len][u16 source_node][u16 id][payload bytes...] */
+
+enum {
+  PROTOCOL_VERSION = 6, // adjust if needed
+
+  // Message IDs (add any you need)
+  ID_LIST_NODES                   = 0x0001,
+  ID_NODE_PRESENT                 = 0x0002,
+  ID_GET_NODE_DESCRIPTION         = 0x0003,
+  ID_DESCRIPTION                  = 0x0004,
+  ID_NAMED_VARIABLE_DESCRIPTION   = 0x0005,
+  ID_GET_VARIABLES                = 0x0006,
+  ID_VARIABLES                    = 0x0007,
+  ID_SET_VARIABLES                = 0x0008,
+  ID_LOCAL_EVENT_DESCRIPTION      = 0x0009,
+  ID_NATIVE_FUNCTION_DESCRIPTION  = 0x000A,
+  ID_SET_BYTECODE                 = 0x000B,
+  ID_RESET                        = 0x000C,
+  ID_RUN                          = 0x000D,
+  ID_GET_DEVICE_INFO              = 0x000E,
+  ID_DEVICE_INFO                  = 0x000F,
+  ID_GET_NODE_DESCRIPTION_FRAGMENT= 0x0010,
+  ID_EXECUTION_STATE_CHANGED      = 0x0011,
+
+  ID_FIRST_ASEBA_ID               = 0x8000  // per your Python check
+};
+
+typedef struct {
+  uint16_t id;
+  uint16_t source_node;
+  uint16_t payload_len;
+  uint8_t* payload; // owned
+  // (Decoded convenience fields could go here if you implement them)
+} Message;
+
+static void message_free(Message* m){ if(m){ free(m->payload); memset(m,0,sizeof(*m)); } }
+
+static uint8_t* message_serialize(const Message* m, size_t* out_len){
+  size_t n = 2+2+2 + m->payload_len;
+  uint8_t* buf = xmalloc(n);
+  wr_u16le(buf+0, m->payload_len);
+  wr_u16le(buf+2, m->source_node);
+  wr_u16le(buf+4, m->id);
+  if(m->payload_len) memcpy(buf+6, m->payload, m->payload_len);
+  *out_len = n;
+  return buf;
+}
+
+static Message message_from_parts(uint16_t id, uint16_t source_node, const uint8_t* payload, size_t n){
+  Message m = {0};
+  m.id = id; m.source_node = source_node; m.payload_len = (uint16_t)n;
+  if(n){ m.payload = xmalloc(n); memcpy(m.payload, payload, n); }
+  return m;
+}
+
+// helpers similar to Python Message.uint16array_to_bytes / bytes_to_uint16array
+typedef struct { uint16_t* v; size_t n; } U16Arr;
+static uint8_t* u16arr_to_bytes(const uint16_t* v, size_t n, size_t* out_len){
+  size_t bytes = n*2;
+  uint8_t* b = xmalloc(bytes);
+  for(size_t i=0;i<n;i++) wr_u16le(b+2*i, v[i]);
+  *out_len = bytes;
+  return b;
+}
+static U16Arr bytes_to_u16arr(const uint8_t* b, size_t n){
+  U16Arr a={0};
+  if(n%2!=0) return a;
+  a.n = n/2;
+  a.v = xmalloc(a.n*sizeof(uint16_t));
+  for(size_t i=0;i<a.n;i++) a.v[i] = rd_u16le(b+2*i);
+  return a;
+}
+
+/* =============================== IO abstraction =============================== */
+
+typedef struct {
+  // must be blocking
+  ssize_t (*read)(void* self, void* buf, size_t n);
+  ssize_t (*write)(void* self, const void* buf, size_t n);
+  void    (*close)(void* self);
+  bool    (*is_closed)(void* self);
+  void*   impl;
+} IO;
+
+static bool io_read_exact(IO* io, void* buf, size_t n){
+  uint8_t* p = buf;
+  size_t got = 0;
+  while(got < n){
+    ssize_t r = io->read(io->impl, p+got, n-got);
+    if(r == 0) return false;        // EOF / timeout treated as failure
+    if(r < 0) return false;         // error
+    got += (size_t)r;
+  }
+  return true;
+}
+
+static bool io_write_all(IO* io, const void* buf, size_t n){
+  const uint8_t* p = buf; size_t sent=0;
+  while(sent<n){
+    ssize_t w = io->write(io->impl, p+sent, n-sent);
+    if(w <= 0) return false;
+    sent += (size_t)w;
+  }
+  return true;
+}
+
+/* ---- TCP client IO ---- */
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+typedef struct { int fd; bool closed; } TCPClient;
+
+static ssize_t tcp_read(void* self, void* buf, size_t n){
+  TCPClient* c = (TCPClient*)self;
+  ssize_t r = recv(c->fd, buf, n, 0);
+  if(r == 0) c->closed = true;
+  return r;
+}
+static ssize_t tcp_write(void* self, const void* buf, size_t n){
+  TCPClient* c = (TCPClient*)self;
+  return send(c->fd, buf, n, 0);
+}
+static void tcp_close(void* self){
+  TCPClient* c = (TCPClient*)self;
+  if(!c->closed){ close(c->fd); c->closed = true; }
+}
+static bool tcp_is_closed(void* self){
+  TCPClient* c = (TCPClient*)self; return c->closed;
+}
+
+static IO io_tcp_connect(const char* host, uint16_t port){
+  struct addrinfo hints={0}, *res=NULL;
+  hints.ai_socktype = SOCK_STREAM;
+  int rc = getaddrinfo(host, NULL, &hints, &res);
+  if(rc!=0 || !res){ fprintf(stderr,"getaddrinfo: %s\n", gai_strerror(rc)); exit(1); }
+  int fd = socket(res->ai_family, SOCK_STREAM, 0);
+  if(fd<0){ perror("socket"); exit(1); }
+
+  // set port
+  if(res->ai_family == AF_INET){
+    ((struct sockaddr_in*)res->ai_addr)->sin_port = htons(port);
+  }else if(res->ai_family == AF_INET6){
+    ((struct sockaddr_in6*)res->ai_addr)->sin6_port = htons(port);
+  }
+  if(connect(fd, res->ai_addr, res->ai_addrlen) < 0){ perror("connect"); exit(1); }
+  freeaddrinfo(res);
+
+  TCPClient* impl = xmalloc(sizeof(*impl));
+  impl->fd = fd; impl->closed=false;
+
+  IO io = {
+    .read = tcp_read, .write = tcp_write, .close = tcp_close, .is_closed = tcp_is_closed,
+    .impl = impl
+  };
+  return io;
+}
+
+/* ---- Null IO (no connection) ---- */
+typedef struct { bool closed; } NullIO;
+static ssize_t null_read(void* self, void* buf, size_t n){ (void)self;(void)buf;(void)n; errno=EAGAIN; return -1; }
+static ssize_t null_write(void* self, const void* buf, size_t n){ (void)self;(void)buf; return (ssize_t)n; }
+static void null_close(void* self){ ((NullIO*)self)->closed=true; }
+static bool null_is_closed(void* self){ return ((NullIO*)self)->closed; }
+
+static IO io_null(void){
+  NullIO* impl = xmalloc(sizeof(*impl)); impl->closed=false;
+  IO io={ .read=null_read, .write=null_write, .close=null_close, .is_closed=null_is_closed, .impl=impl };
+  return io;
+}
+
+/* =============================== RemoteNode =============================== */
+
+typedef struct { char** v; size_t n, cap; } StrVec;
+typedef struct { uint16_t* v; size_t n, cap; } U16Vec;
+
+static void svec_push(StrVec* a, const char* s){ if(a->n==a->cap){ a->cap=a->cap? a->cap*2:8; a->v=xrealloc(a->v,a->cap*sizeof(char*)); } a->v[a->n++]=xstrdup(s); }
+static void u16v_push(U16Vec* a, uint16_t x){ if(a->n==a->cap){ a->cap=a->cap? a->cap*2:16; a->v=xrealloc(a->v,a->cap*sizeof(uint16_t)); } a->v[a->n++]=x; }
+
+typedef struct KVU16 { char* key; uint16_t val; } KVU16;
+typedef struct KVI   { char* key; int      val; } KVI;
+
+typedef struct { KVU16* v; size_t n, cap; } MapU16;
+typedef struct { KVI*   v; size_t n, cap; } MapI;
+
+static void mapu16_set(MapU16* m, const char* k, uint16_t v){
+  for(size_t i=0;i<m->n;i++) if(strcmp(m->v[i].key,k)==0){ m->v[i].val=v; return; }
+  if(m->n==m->cap){ m->cap=m->cap? m->cap*2:16; m->v=xrealloc(m->v,m->cap*sizeof(KVU16)); }
+  m->v[m->n].key=xstrdup(k); m->v[m->n].val=v; m->n++;
+}
+static void mapi_set(MapI* m, const char* k, int v){
+  for(size_t i=0;i<m->n;i++) if(strcmp(m->v[i].key,k)==0){ m->v[i].val=v; return; }
+  if(m->n==m->cap){ m->cap=m->cap? m->cap*2:16; m->v=xrealloc(m->v,m->cap*sizeof(KVI)); }
+  m->v[m->n].key=xstrdup(k); m->v[m->n].val=v; m->n++;
+}
+static bool mapu16_get(MapU16* m, const char* k, uint16_t* out){
+  for(size_t i=0;i<m->n;i++) if(strcmp(m->v[i].key,k)==0){ *out=m->v[i].val; return true; }
+  return false;
+}
+static bool mapi_get(MapI* m, const char* k, int* out){
+  for(size_t i=0;i<m->n;i++) if(strcmp(m->v[i].key,k)==0){ *out=m->v[i].val; return true; }
+  return false;
+}
+
+typedef struct {
+  int node_id;           // optional
+  int version;           // optional
+  char* device_name;
+  char* device_uuid;
+  uint16_t rf_network_id, rf_node_id, rf_channel;
+
+  double last_msg_time;  // seconds
+  bool handshake_done;
+
+  char* name;
+  uint16_t bytecode_size, stack_size, max_var_size;
+  uint16_t num_named_var, num_local_events, num_native_fun;
+
+  uint16_t var_total_size;
+  StrVec   named_variables;
+  MapU16   var_offset;   // name -> offset
+  MapU16   var_size;     // name -> size
+  U16Vec   var_data;
+
+  uint16_t expected_var_end;
+  bool     var_received;
+
+  StrVec   local_events;
+  StrVec   native_functions;
+  // native_functions_arg_sizes: name -> packed info; leave as int
+  MapI     native_functions_arg_sizes;
+} RemoteNode;
+
+static void rn_init(RemoteNode* rn){
+  memset(rn,0,sizeof(*rn));
+}
+
+static void rn_add_var(RemoteNode* rn, const char* name, uint16_t size){
+  svec_push(&rn->named_variables, name);
+  mapu16_set(&rn->var_offset, name, rn->var_total_size);
+  mapu16_set(&rn->var_size,   name, size);
+  rn->var_total_size += size;
+}
+
+static void rn_reset_var_data(RemoteNode* rn){
+  rn->var_data.n = 0; rn->var_data.cap = 0; free(rn->var_data.v); rn->var_data.v=NULL;
+  for(uint16_t i=0;i<rn->var_total_size;i++) u16v_push(&rn->var_data, 0);
+}
+
+static uint16_t rn_get_var(RemoteNode* rn, const char* name, uint16_t index){
+  uint16_t off=0;
+  if(!mapu16_get(&rn->var_offset, name, &off)) { fprintf(stderr,"KeyError: %s\n", name); exit(1); }
+  return rn->var_data.v[off + index];
+}
+
+static void rn_set_var(RemoteNode* rn, const char* name, uint16_t val, uint16_t index){
+  uint16_t off=0;
+  if(!mapu16_get(&rn->var_offset, name, &off)) { fprintf(stderr,"KeyError: %s\n", name); exit(1); }
+  rn->var_data.v[off + index] = val;
+}
+
+static void rn_set_var_array(RemoteNode* rn, const char* name, const uint16_t* vals, size_t n){
+  uint16_t off=0, size=0;
+  if(!mapu16_get(&rn->var_offset, name, &off)) { fprintf(stderr,"KeyError: %s\n", name); exit(1); }
+  if(!mapu16_get(&rn->var_size,   name, &size)) { fprintf(stderr,"KeyError size: %s\n", name); exit(1); }
+  size_t to = n < size ? n : size;
+  for(size_t i=0;i<to;i++) rn->var_data.v[off+i] = vals[i];
+}
+
+static void rn_set_var_data(RemoteNode* rn, uint16_t offset, const uint16_t* data, size_t n){
+  for(size_t i=0;i<n;i++){
+    size_t idx = (size_t)offset + i;
+    if(idx < rn->var_data.n) rn->var_data.v[idx] = data[i];
+  }
+  rn->var_received = (offset + n) >= rn->expected_var_end;
+}
+
+typedef struct { uint16_t offset, length; } Span;
+
+static Span rn_data_span_for_variables(RemoteNode* rn, const char** names, size_t n_names){
+  bool has=false; uint16_t offset=0, length=0;
+  for(size_t i=0;i<n_names;i++){
+    uint16_t off=0,size=0;
+    if(!mapu16_get(&rn->var_offset, names[i], &off)) { fprintf(stderr,"KeyError: %s\n", names[i]); exit(1); }
+    if(!mapu16_get(&rn->var_size,   names[i], &size)) { fprintf(stderr,"KeyError size: %s\n", names[i]); exit(1); }
+    if(!has){ has=true; offset=off; length=size; }
+    else if(off < offset){ length += offset - off; offset = off; if(length < size) length = size; }
+    else { if(length < (off + size - offset)) length = off + size - offset; }
+  }
+  Span s = { .offset = offset, .length = length };
+  return s;
+}
+
+/* =============================== Connection =============================== */
+
+typedef struct Connection Connection;
+
+typedef void (*OnConnectionChanged)(Connection*, int node_id, bool connected);
+typedef void (*OnVariablesReceived)(Connection*, int node_id);
+typedef void (*OnExecutionStateChanged)(Connection*, int node_id, uint16_t pc, uint16_t flags);
+typedef void (*OnUserEvent)(Connection*, int node_id, uint16_t event_id, const uint16_t* args, size_t nargs);
+typedef void (*OnCommError)(Connection*, const char* errmsg);
+
+typedef struct NodeMap { int* keys; RemoteNode* vals; size_t n, cap; } NodeMap;
+static RemoteNode* nodemap_get_or_create(NodeMap* m, int key){
+  for(size_t i=0;i<m->n;i++) if(m->keys[i]==key) return &m->vals[i];
+  if(m->n==m->cap){ m->cap=m->cap? m->cap*2:4; m->keys=xrealloc(m->keys,m->cap*sizeof(int)); m->vals=xrealloc(m->vals,m->cap*sizeof(RemoteNode)); }
+  m->keys[m->n]=key; rn_init(&m->vals[m->n]); m->vals[m->n].node_id = key; m->n++; return &m->vals[m->n-1];
+}
+
+struct Connection {
+  IO io;
+  bool debug;
+  double timeout_sec;
+  int host_node_id;
+
+  pthread_t input_thread;
+  pthread_mutex_t input_lock;
+  pthread_mutex_t output_lock;
+
+  volatile bool shutting_down;
+
+  // refresh thread
+  pthread_t refresh_thread;
+  bool refresh_enabled;
+  double refresh_rate; // seconds
+  // coverage: NULL means all; otherwise span computed when vars known
+  const char** refresh_coverage_names;
+  size_t       refresh_coverage_count;
+  bool         refresh_have_span;
+  Span         refresh_span;
+
+  // remote nodes
+  NodeMap nodes; // node_id -> RemoteNode
+  // connected set is implicit: nodes present + handshake_done
+  // but we also track last_msg_time per node
+
+  // callbacks
+  OnConnectionChanged on_connection_changed;
+  OnVariablesReceived on_variables_received;
+  OnExecutionStateChanged on_execution_state_changed;
+  OnUserEvent on_user_event;
+  OnCommError on_comm_error;
+};
+
+/* ----------------- Input thread: read framed messages ----------------- */
+
+typedef struct { Connection* c; } InputCtx;
+
+static bool read_message(IO* io, Message* out){
+  uint8_t hdr[6];
+  if(!io_read_exact(io, hdr, 6)) return false;
+  uint16_t payload_len = rd_u16le(hdr+0);
+  out->source_node = rd_u16le(hdr+2);
+  out->id          = rd_u16le(hdr+4);
+  out->payload_len = payload_len;
+  if(payload_len){
+    out->payload = xmalloc(payload_len);
+    if(!io_read_exact(io, out->payload, payload_len)){ free(out->payload); out->payload=NULL; return false; }
+  }else out->payload=NULL;
+  return true;
+}
+
+static double now_sec(void){
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  return (double)ts.tv_sec + ts.tv_nsec/1e9;
+}
+
+/* ----------------- Sending ----------------- */
+
+static void conn_send(Connection* c, const Message* m){
+  pthread_mutex_lock(&c->output_lock);
+  size_t n=0; uint8_t* buf = message_serialize(m, &n);
+  if(c->debug){ fprintf(stderr, "> send id=0x%04x src=%d payload=%zu\n", m->id, m->source_node, (size_t)m->payload_len); }
+  if(!io_write_all(&c->io, buf, n)){
+    if(c->on_comm_error) c->on_comm_error(c, "write failed");
+  }
+  free(buf);
+  pthread_mutex_unlock(&c->output_lock);
+}
+
+/* ----------------- Outgoing helpers (mirror Python) ----------------- */
+
+static void conn_list_nodes(Connection* c){
+  uint16_t arr[] = { PROTOCOL_VERSION };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 1, &blen);
+  Message m = message_from_parts(ID_LIST_NODES, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static void conn_get_node_description(Connection* c, int target){
+  uint16_t arr[] = { (uint16_t)target, PROTOCOL_VERSION };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 2, &blen);
+  Message m = message_from_parts(ID_GET_NODE_DESCRIPTION, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static void conn_get_node_description_fragment(Connection* c, int target, uint16_t fragment){
+  uint16_t arr[] = { (uint16_t)target, PROTOCOL_VERSION, fragment };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 3, &blen);
+  Message m = message_from_parts(ID_GET_NODE_DESCRIPTION_FRAGMENT, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static uint16_t conn_get_target_node_var_total_size(Connection* c, int target){
+  pthread_mutex_lock(&c->input_lock);
+  uint16_t total = 0;
+  for(size_t i=0;i<c->nodes.n;i++) if(c->nodes.keys[i]==target){ total = c->nodes.vals[i].var_total_size; break; }
+  pthread_mutex_unlock(&c->input_lock);
+  return total;
+}
+static void conn_get_variables(Connection* c, int target, uint16_t chunk_offset, int chunk_length_opt){
+  if(target < 0) return;
+  uint16_t chunk_length = (uint16_t)((chunk_length_opt<0) ?
+    (conn_get_target_node_var_total_size(c, target) - chunk_offset) : chunk_length_opt);
+  uint16_t arr[] = { (uint16_t)target, chunk_offset, chunk_length };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 3, &blen);
+  Message m = message_from_parts(ID_GET_VARIABLES, (uint16_t)c->host_node_id, b, blen);
+  pthread_mutex_lock(&c->input_lock);
+  RemoteNode* rn = nodemap_get_or_create(&c->nodes, target);
+  rn->expected_var_end = chunk_offset + chunk_length;
+  pthread_mutex_unlock(&c->input_lock);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static void conn_set_variables(Connection* c, int target, uint16_t chunk_offset, const uint16_t* chunk, size_t n){
+  size_t blen=0;
+  uint16_t* arr = xmalloc((2+n)*sizeof(uint16_t));
+  arr[0]=(uint16_t)target; arr[1]=chunk_offset;
+  for(size_t i=0;i<n;i++) arr[2+i]=chunk[i];
+  uint8_t* b = u16arr_to_bytes(arr, 2+n, &blen);
+  Message m = message_from_parts(ID_SET_VARIABLES, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); free(arr); message_free(&m);
+}
+static void conn_set_bytecode(Connection* c, int target, const uint16_t* bc, size_t n_words, uint16_t address){
+  size_t i=0;
+  while(i<n_words){
+    size_t sz = (n_words - i);
+    if(sz > 256) sz = 256; // chunks of up to 256 words like Python
+    size_t blen=0;
+    uint16_t* arr = xmalloc((2+sz)*sizeof(uint16_t));
+    arr[0] = (uint16_t)target;
+    arr[1] = (uint16_t)(address + i);
+    for(size_t k=0;k<sz;k++) arr[2+k] = bc[i+k];
+    uint8_t* b = u16arr_to_bytes(arr, 2+sz, &blen);
+    Message m = message_from_parts(ID_SET_BYTECODE, (uint16_t)c->host_node_id, b, blen);
+    conn_send(c, &m); free(arr); free(b); message_free(&m);
+    i += sz;
+  }
+}
+static void conn_reset(Connection* c, int target){
+  uint16_t arr[] = { (uint16_t)target };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 1, &blen);
+  Message m = message_from_parts(ID_RESET, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static void conn_run(Connection* c, int target){
+  uint16_t arr[] = { (uint16_t)target };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 1, &blen);
+  Message m = message_from_parts(ID_RUN, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+enum {
+  DEVICE_INFO_NAME = 1,
+  DEVICE_INFO_THYMIO2_RF_SETTINGS = 2,
+  DEVICE_INFO_UUID = 3
+};
+static void conn_get_device_info_ex(Connection* c, int target, uint16_t which){
+  uint16_t arr[] = { (uint16_t)target, which };
+  size_t blen=0; uint8_t* b = u16arr_to_bytes(arr, 2, &blen);
+  Message m = message_from_parts(ID_GET_DEVICE_INFO, (uint16_t)c->host_node_id, b, blen);
+  conn_send(c, &m); free(b); message_free(&m);
+}
+static void conn_get_device_info(Connection* c, int target, int which /* -1 for all */){
+  if(which < 0){
+    conn_get_device_info_ex(c, target, DEVICE_INFO_NAME);
+    conn_get_device_info_ex(c, target, DEVICE_INFO_THYMIO2_RF_SETTINGS);
+    conn_get_device_info_ex(c, target, DEVICE_INFO_UUID);
+  }else{
+    conn_get_device_info_ex(c, target, (uint16_t)which);
+  }
+}
+
+/* ----------------- Handler (translate Python handle_message) ----------------- */
+/* NOTE: Here we don’t know your exact payload layouts; add decoding where needed. */
+
+static void handle_message(Connection* c, Message* msg){
+  if(c->debug){ fprintf(stderr,"< recv id=0x%04x src=%u payload=%u\n", msg->id, msg->source_node, msg->payload_len); }
+
+  int source_node = msg->source_node;
+
+  if(msg->id == ID_NODE_PRESENT){
+    bool will_do_handshake = false;
+    pthread_mutex_lock(&c->input_lock);
+    RemoteNode* rn = nodemap_get_or_create(&c->nodes, source_node);
+    rn->version = PROTOCOL_VERSION; // TODO: decode actual version from payload if present
+    will_do_handshake = true;       // mirrors auto_handshake=True behavior
+    pthread_mutex_unlock(&c->input_lock);
+
+    if(will_do_handshake){
+      // In Python: if version >= 6 -> get_device_info
+      conn_get_device_info(c, source_node, -1);
+      conn_get_node_description(c, source_node);
+    }
+  }
+  else if(msg->id == ID_DEVICE_INFO){
+    // TODO decode: update rn->device_name / uuid / RF settings depending on device_info selector.
+    // If something changed, you may want to notify via on_connection_changed (Python only sets flag)
+  }
+  else if(msg->id == ID_DESCRIPTION){
+    // TODO decode description; for now we just ensure node exists
+    pthread_mutex_lock(&c->input_lock);
+    (void)nodemap_get_or_create(&c->nodes, source_node);
+    pthread_mutex_unlock(&c->input_lock);
+  }
+  else if(msg->id == ID_NAMED_VARIABLE_DESCRIPTION){
+    // Expected payload: var_name (string?) + var_size (u16) — format not specified here.
+    // You should parse and call rn_add_var(rn, name, size).
+    pthread_mutex_lock(&c->input_lock);
+    RemoteNode* rn = nodemap_get_or_create(&c->nodes, source_node);
+    // TODO decode; example:
+    // rn_add_var(rn, "example", 1);
+    // If all variables known: rn_reset_var_data(rn); and start refresh thread if enabled
+    pthread_mutex_unlock(&c->input_lock);
+  }
+  else if(msg->id == ID_VARIABLES){
+    // Payload: [var_offset, ...data words]
+    U16Arr arr = bytes_to_u16arr(msg->payload, msg->payload_len);
+    if(arr.n >= 1){
+      uint16_t off = arr.v[0];
+      pthread_mutex_lock(&c->input_lock);
+      RemoteNode* rn = nodemap_get_or_create(&c->nodes, source_node);
+      if(arr.n > 1) rn_set_var_data(rn, off, &arr.v[1], arr.n - 1);
+      bool notify = rn->var_received;
+      pthread_mutex_unlock(&c->input_lock);
+      if(notify && c->on_variables_received) c->on_variables_received(c, source_node);
+    }
+    free(arr.v);
+  }
+  else if(msg->id == ID_NATIVE_FUNCTION_DESCRIPTION){
+    // TODO decode: push fun name and arg sizes into rn->native_functions / native_functions_arg_sizes
+    pthread_mutex_lock(&c->input_lock);
+    RemoteNode* rn = nodemap_get_or_create(&c->nodes, source_node);
+    rn->handshake_done = true;
+    pthread_mutex_unlock(&c->input_lock);
+    if(c->on_connection_changed) c->on_connection_changed(c, source_node, true);
+  }
+  else if(msg->id == ID_LOCAL_EVENT_DESCRIPTION){
+    // TODO decode: append name to rn->local_events
+  }
+  else if(msg->id == ID_EXECUTION_STATE_CHANGED){
+    // Payload: [pc, flags]
+    U16Arr arr = bytes_to_u16arr(msg->payload, msg->payload_len);
+    if(arr.n >= 2 && c->on_execution_state_changed){
+      c->on_execution_state_changed(c, source_node, arr.v[0], arr.v[1]);
+    }
+    free(arr.v);
+  }
+  else if(msg->id < ID_FIRST_ASEBA_ID){
+    // user event emitted
+    if(c->on_user_event){
+      U16Arr arr = bytes_to_u16arr(msg->payload, msg->payload_len);
+      c->on_user_event(c, source_node, msg->id, arr.v, arr.n);
+      free(arr.v);
+    }
+  }
+
+  // Update last_msg_time
+  pthread_mutex_lock(&c->input_lock);
+  RemoteNode* rn = nodemap_get_or_create(&c->nodes, source_node);
+  rn->last_msg_time = now_sec();
+  pthread_mutex_unlock(&c->input_lock);
+}
+
+static void* input_thread_main(void* arg){
+  Connection* c = (Connection*)arg;
+  while(!c->shutting_down){
+    Message m = {0};
+    if(!read_message(&c->io, &m)){
+      // treat short read as timeout/EOF; loop
+      continue;
+    }
+    handle_message(c, &m);
+    message_free(&m);
+  }
+  return NULL;
+}
+
+/* ----------------- Refresh thread ----------------- */
+
+static void* refresh_thread_main(void* arg){
+  Connection* c = (Connection*)arg;
+  while(!c->shutting_down){
+    double start = now_sec();
+
+    // poll variables for all nodes
+    if(c->refresh_enabled){
+      pthread_mutex_lock(&c->input_lock);
+      for(size_t i=0;i<c->nodes.n;i++){
+        int node_id = c->nodes.keys[i];
+        RemoteNode* rn = &c->nodes.vals[i];
+
+        // coverage handling (compute span once variables are known)
+        if(c->refresh_coverage_names && !c->refresh_have_span && rn->named_variables.n>0){
+          c->refresh_span = rn_data_span_for_variables(rn, c->refresh_coverage_names, c->refresh_coverage_count);
+          c->refresh_have_span = true;
+        }
+
+        if(!c->refresh_coverage_names){
+          pthread_mutex_unlock(&c->input_lock);
+          conn_get_variables(c, node_id, 0, -1);
+          pthread_mutex_lock(&c->input_lock);
+        }else if(c->refresh_have_span && c->refresh_span.length > 0){
+          uint16_t off = c->refresh_span.offset;
+          uint16_t len = c->refresh_span.length;
+          pthread_mutex_unlock(&c->input_lock);
+          conn_get_variables(c, node_id, off, len);
+          pthread_mutex_lock(&c->input_lock);
+        }
+      }
+
+      // disconnection detection (timeout)
+      double tnow = now_sec();
+      for(size_t i=0;i<c->nodes.n;i++){
+        RemoteNode* rn = &c->nodes.vals[i];
+        if((tnow - rn->last_msg_time) > c->timeout_sec){
+          // consider it disconnected
+          if(c->on_connection_changed)
+            c->on_connection_changed(c, c->nodes.keys[i], false);
+          // do NOT delete node here to keep code simple; user can rebuild
+        }
+      }
+      pthread_mutex_unlock(&c->input_lock);
+    }
+
+    // sleep
+    double elapsed = now_sec() - start;
+    double wait = c->refresh_rate - elapsed;
+    if(wait < 0.01) wait = 0.01;
+    struct timespec ts;
+    ts.tv_sec = (time_t)wait;
+    ts.tv_nsec = (long)((wait - ts.tv_sec)*1e9);
+    nanosleep(&ts, NULL);
+  }
+  return NULL;
+}
+
+/* =============================== Public API =============================== */
+
+static Connection* connection_tcp(const char* host, uint16_t port, int host_node_id, bool debug){
+  Connection* c = xmalloc(sizeof(*c));
+  memset(c,0,sizeof(*c));
+  c->io = io_tcp_connect(host, port);
+  c->debug = debug;
+  c->timeout_sec = 3.0;
+  c->host_node_id = host_node_id;
+
+  pthread_mutex_init(&c->input_lock, NULL);
+  pthread_mutex_init(&c->output_lock, NULL);
+
+  // threads
+  c->shutting_down = false;
+  pthread_create(&c->input_thread, NULL, input_thread_main, c);
+
+  // no auto refresh by default
+  c->refresh_enabled = false;
+  c->refresh_rate = 0.5;
+
+  return c;
+}
+
+static Connection* connection_null(int host_node_id){
+  Connection* c = xmalloc(sizeof(*c));
+  memset(c,0,sizeof(*c));
+  c->io = io_null();
+  c->debug = false;
+  c->timeout_sec = 3.0;
+  c->host_node_id = host_node_id;
+  pthread_mutex_init(&c->input_lock, NULL);
+  pthread_mutex_init(&c->output_lock, NULL);
+  c->shutting_down = false;
+  pthread_create(&c->input_thread, NULL, input_thread_main, c);
+  return c;
+}
+
+static void connection_close(Connection* c){
+  if(!c) return;
+  if(c->io.close) c->io.close(c->io.impl);
+}
+
+static void connection_shutdown(Connection* c){
+  if(!c) return;
+  c->shutting_down = true;
+  pthread_join(c->input_thread, NULL);
+  if(c->refresh_enabled) pthread_join(c->refresh_thread, NULL);
+  connection_close(c);
+  pthread_mutex_destroy(&c->input_lock);
+  pthread_mutex_destroy(&c->output_lock);
+  free(c->io.impl);
+  free(c);
+}
+
+static void connection_set_refreshing_rate(Connection* c, double rate_sec){
+  c->refresh_rate = rate_sec;
+  if(rate_sec > 0){
+    if(!c->refresh_enabled){
+      c->refresh_enabled = true;
+      pthread_create(&c->refresh_thread, NULL, refresh_thread_main, c);
+    }
+  }else{
+    c->refresh_enabled = false;
+  }
+}
+
+static void connection_set_refreshing_coverage(Connection* c, const char** names, size_t count){
+  c->refresh_coverage_names = names;
+  c->refresh_coverage_count = count;
+  c->refresh_have_span = false; // recompute once vars known
+}
+
+static void connection_handshake(Connection* c){
+  // equivalent to auto_handshake=True + list_nodes()
+  conn_list_nodes(c);
+}
+
+static int connection_one_remote_node_id(Connection* c){
+  pthread_mutex_lock(&c->input_lock);
+  int id = (c->nodes.n>0)? c->nodes.keys[0] : -1;
+  pthread_mutex_unlock(&c->input_lock);
+  return id;
+}
+
+/* Expose a subset of the Python-like methods */
+static void connection_list_nodes(Connection* c){ conn_list_nodes(c); }
+static void connection_get_node_description(Connection* c, int node){ conn_get_node_description(c, node); }
+static void connection_get_node_description_fragment(Connection* c, int node, uint16_t frag){ conn_get_node_description_fragment(c, node, frag); }
+static void connection_get_variables(Connection* c, int node, uint16_t off, int len){ conn_get_variables(c, node, off, len); }
+static void connection_set_variables(Connection* c, int node, uint16_t off, const uint16_t* chunk, size_t n){ conn_set_variables(c, node, off, chunk, n); }
+static void connection_set_bytecode(Connection* c, int node, const uint16_t* bc, size_t n_words, uint16_t addr){ conn_set_bytecode(c, node, bc, n_words, addr); }
+static void connection_reset(Connection* c, int node){ conn_reset(c, node); }
+static void connection_run(Connection* c, int node){ conn_run(c, node); }
+static void connection_get_device_info(Connection* c, int node, int which){ conn_get_device_info(c, node, which); }
+
+/* =============================== Example main =============================== */
+/* Build:
+     cc -std=c11 -O2 -Wall -Wextra thymio_connection.c -lpthread -o thymio_conn
+   Run against a Thymio TCP server (replace host/port):
+     ./thymio_conn 127.0.0.1 33333
+*/
+
+static void on_conn_changed(Connection* c, int node, bool up){
+  (void)c; fprintf(stderr, "[cb] node %d %s\n", node, up?"connected":"disconnected");
+}
+static void on_vars_received(Connection* c, int node){
+  (void)c; fprintf(stderr, "[cb] vars received from %d\n", node);
+}
+static void on_exec_state(Connection* c, int node, uint16_t pc, uint16_t flags){
+  (void)c; fprintf(stderr, "[cb] exec node=%d pc=%u flags=0x%04x\n", node, pc, flags);
+}
+static void on_user_event(Connection* c, int node, uint16_t eid, const uint16_t* a, size_t n){
+  (void)c; fprintf(stderr, "[cb] user event node=%d id=%u args=%zu\n", node, eid, n);
+}
+static void on_comm_err(Connection* c, const char* err){
+  (void)c; fprintf(stderr, "[cb] COMM ERROR: %s\n", err);
+}
+
+int main(int argc, char** argv){
+  const char* host = (argc>1)? argv[1]: "127.0.0.1";
+  uint16_t port = (argc>2)? (uint16_t)atoi(argv[2]): 33333;
+
+  Connection* c = connection_tcp(host, port, /*host_node_id*/1, /*debug*/true);
+  c->on_connection_changed = on_conn_changed;
+  c->on_variables_received = on_vars_received;
+  c->on_execution_state_changed = on_exec_state;
+  c->on_user_event = on_user_event;
+  c->on_comm_error = on_comm_err;
+
+  connection_set_refreshing_rate(c, 0.2); // start auto-refresh
+  connection_handshake(c);
+
+  // simple run loop
+  fprintf(stderr,"Running… press Ctrl+C to exit.\n");
+  for(;;) sleep(1);
+
+  connection_shutdown(c);
+  return 0;
+}
